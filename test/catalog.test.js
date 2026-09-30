@@ -1,28 +1,52 @@
 import assert from "node:assert/strict";
-import { readFile, readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   applyVersionState,
+  assertRecoverableCatalogError,
+  buildCatalog,
+  CatalogBuildError,
   CatalogCheckError,
+  catalogErrorCode,
+  catalogRefreshFailureMessage,
+  catalogSourcePlan,
   communityInstall,
+  currentCatalogApiUsage,
   failedSourcePlugins,
+  githubApiFailure,
+  parseGitHubRepository,
   readLimitedBuffer,
+  repositoryReleaseForRefresh,
   snapshotHttpErrorCode,
   successfulState,
   upstreamCheckErrorCodes,
   validateBeforeStagingPreview,
 } from "../scripts/build-catalog.mjs";
 import {
+  securityBaselineEnforcementMode,
+  securityBaselineVersion,
+} from "../scripts/security-baseline-policy.mjs";
+import { catalogVerificationFields } from "../scripts/catalog-verification.mjs";
+import {
   activityTime,
+  comparePluginInstallRate,
+  installRateScore,
+  selectHiddenGems,
+  medianInstallRate,
   isRecentlyAdded,
   isRecentlyUpdated,
+  listingAgeLabel,
   listingCheckState,
   listingTime,
   paginationState,
   pluginVersionLabel,
+  recentListings,
 } from "../site/assets/js/shared.js";
 
 const catalog = JSON.parse(await readFile(new URL("../site/catalog.json", import.meta.url), "utf8"));
+const registry = JSON.parse(await readFile(new URL("../registry.json", import.meta.url), "utf8"));
 const shaPattern = /^[a-f0-9]{40}$/;
 const timestampPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
@@ -76,6 +100,26 @@ test("catalog IDs are unique", () => {
   assert.equal(new Set(ids).size, ids.length);
 });
 
+test("generated catalog verification fields match deterministic registry status", () => {
+  const sources = new Map(registry.sources.map((source) => [
+    parseGitHubRepository(source.repo).slug.toLowerCase(),
+    source,
+  ]));
+  for (const plugin of catalog.plugins) {
+    if (plugin.builtIn || (plugin.sourceType || "community") !== "community") {
+      assert.equal(plugin.verificationStatus, undefined);
+      assert.equal(plugin.verificationCommit, undefined);
+      continue;
+    }
+    const source = sources.get(parseGitHubRepository(plugin.repo).slug.toLowerCase());
+    assert.ok(source, `registry source for ${plugin.id}`);
+    assert.deepEqual(
+      Object.fromEntries(Object.entries(plugin).filter(([key]) => key.startsWith("verification"))),
+      catalogVerificationFields(source, plugin),
+    );
+  }
+});
+
 test("generated previews contain no missing or orphaned files", async () => {
   const files = (await readdir(new URL("../site/assets/img/plugins/", import.meta.url))).sort();
   const referenced = [...new Set(catalog.plugins.flatMap((plugin) => [
@@ -89,7 +133,7 @@ test("catalog has no manual featured ranking", () => {
   assert.equal(catalog.plugins.some((plugin) => Object.hasOwn(plugin, "featured")), false);
   assert.equal(catalog.plugins.some((plugin) => Object.hasOwn(plugin, "releaseTag")), false);
   assert.equal(catalog.plugins.some((plugin) => Object.hasOwn(plugin, "releaseUpdatedAt")), false);
-  assert.equal(catalog.stateSchemaVersion, 1);
+  assert.equal(catalog.stateSchemaVersion, 2);
 });
 
 test("listing checks distinguish passed, failed, and unreachable snapshots", () => {
@@ -136,6 +180,62 @@ test("listing checks distinguish passed, failed, and unreachable snapshots", () 
     commitLabel: "Last compatible",
     checkedCommit: compatibleCommit,
     lastSuccessfulAt: "2026-07-28T11:00:00.000Z",
+    comparison: "unknown",
+  });
+});
+
+test("listing checks normalize and fail closed on stale commit metadata", () => {
+  const listingCommit = "a".repeat(40);
+  const changedCommit = "b".repeat(40);
+
+  assert.deepEqual(listingCheckState({
+    listingValidatedCommit: listingCommit.toUpperCase(),
+    upstreamObservedCommit: listingCommit,
+    upstreamValidatedCommit: changedCommit,
+    upstreamCheckStatus: "passed",
+  }), {
+    statusLabel: "Passed",
+    statusTone: "is-passed",
+    commitLabel: "Checked commit",
+    checkedCommit: listingCommit,
+    comparison: "unchanged",
+  });
+
+  assert.deepEqual(listingCheckState({
+    listingValidatedCommit: listingCommit,
+    upstreamValidatedCommit: changedCommit,
+    upstreamCheckStatus: "passed",
+  }), {
+    statusLabel: "Passed",
+    statusTone: "is-passed",
+    commitLabel: "Checked commit",
+    checkedCommit: changedCommit,
+    comparison: "changed",
+  });
+
+  assert.deepEqual(listingCheckState({
+    listingValidatedCommit: listingCommit,
+    upstreamObservedCommit: "malformed",
+    upstreamValidatedCommit: changedCommit.toUpperCase(),
+    upstreamCheckStatus: "passed",
+  }), {
+    statusLabel: "Passed",
+    statusTone: "is-passed",
+    commitLabel: "Checked commit",
+    checkedCommit: changedCommit,
+    comparison: "changed",
+  });
+
+  assert.deepEqual(listingCheckState({
+    listingValidatedCommit: listingCommit,
+    upstreamObservedCommit: "malformed",
+    upstreamValidatedCommit: "also-malformed",
+    upstreamCheckStatus: "passed",
+  }), {
+    statusLabel: "Passed",
+    statusTone: "is-passed",
+    commitLabel: "Checked commit",
+    checkedCommit: "",
     comparison: "unknown",
   });
 });
@@ -228,13 +328,15 @@ test("manual installation overrides are explicit and restricted to root plugins"
     () => communityInstall(source, "manifest.json", {
       installation: { mode: "script", note },
     }),
-    /invalid manual installation override/,
+    (error) => !(error instanceof CatalogCheckError)
+      && /invalid manual installation override/.test(error.message),
   );
   assert.throws(
     () => communityInstall(source, "nested/manifest.json", {
       installation: { mode: "manual", note },
     }),
-    /invalid manual installation override/,
+    (error) => error instanceof CatalogCheckError
+      && error.code === "unsupported-repository-layout",
   );
 });
 
@@ -248,8 +350,11 @@ test("built-in plugins are separated from installable community plugins", () => 
     assert.ok(["Add to bar", "Enable plugin"].includes(plugin.officialCommandLabel));
     assert.equal(plugin.addedAt, undefined);
     assert.match(plugin.id, /^omarchy\./);
-    assert.match(plugin.sourceUrl, /^https:\/\/github\.com\/basecamp\/omarchy\/tree\/[a-f0-9]{40}\//);
+    assert.equal(plugin.repo, "https://github.com/omacom/omarchy");
+    assert.match(plugin.sourceUrl, /^https:\/\/github\.com\/omacom\/omarchy\/tree\/[a-f0-9]{40}\//);
   }
+  assert.ok(catalog.plugins.find((plugin) => plugin.id === "omarchy.agents")?.tags.includes("ai"));
+  assert.ok(catalog.plugins.find((plugin) => plugin.id === "omarchy.polkit")?.tags.includes("security"));
 });
 
 test("Taildrop is replaced by the built-in Tailscale panel", () => {
@@ -299,6 +404,18 @@ test("root plugins default to Quattro while curated exceptions use manual setup"
     "This plugin requires additional setup before it can be enabled. Follow the upstream installation instructions.",
   );
 
+  const ytdl = catalog.plugins.find((entry) => entry.id === "bibek.ytdl");
+  assert.equal(ytdl?.repositoryLayout, "root-plugin");
+  assert.equal(ytdl?.installAvailable, false);
+  assert.equal(ytdl?.installCommand, "");
+  assert.equal(ytdl?.status, "Manual setup");
+  assert.equal(ytdl?.installNote, "This plugin requires additional setup before it can be enabled. Follow the upstream installation instructions.");
+  const ytdlSource = registry.sources.find((source) => source.repo === "https://github.com/BibekBhusal0/omarchy-ytdl");
+  assert.deepEqual(ytdlSource?.plugins?.["bibek.ytdl"]?.installation, {
+    mode: "manual",
+    note: "This plugin requires additional setup before it can be enabled. Follow the upstream installation instructions.",
+  });
+
   for (const [id, repository] of [
     ["nille.emeet-pixy", "https://github.com/nille/omarchy-emeet-pixy.git"],
     ["ky.seerr-requests", "https://github.com/Kyrunner/omarchy-seerr-requests.git"],
@@ -322,13 +439,80 @@ test("root plugins default to Quattro while curated exceptions use manual setup"
   assert.equal(lacuna?.installAvailable, false);
 });
 
-test("recently added badges use a 3-day listing window", () => {
-  const now = Date.parse("2026-07-28T00:00:00Z");
-  assert.equal(isRecentlyAdded({ addedAt: "2026-07-28" }, now), true);
-  assert.equal(isRecentlyAdded({ addedAt: "2026-07-26" }, now), true);
-  assert.equal(isRecentlyAdded({ addedAt: "2026-07-25" }, now), false);
-  assert.equal(isRecentlyAdded({ addedAt: "2026-07-28", placeholder: true }, now), false);
-  assert.equal(isRecentlyAdded({ addedAt: "2026-07-28", builtIn: true }, now), false);
+test("install rate ranks by the Wilson lower bound of copies per view", () => {
+  const plugin = (id, extra = {}) => ({ id, name: id, installCommand: `omarchy plugin add ${id}`, ...extra });
+  const wilson = (copies, views) => {
+    const rate = copies / views;
+    const z = 1.96;
+    return (rate + z * z / (2 * views) - z * Math.sqrt((rate * (1 - rate) + z * z / (4 * views)) / views)) / (1 + z * z / views);
+  };
+  assert.ok(Math.abs(installRateScore(plugin("a"), { views: 297, copies: 161 }) - wilson(161, 297)) < 1e-12);
+  assert.ok(Math.abs(wilson(161, 297) - 0.4852) < 0.001);
+  assert.equal(installRateScore(plugin("few"), { views: 19, copies: 19 }), -1);
+  assert.equal(installRateScore(plugin("manual", { installCommand: "" }), { views: 500, copies: 0 }), -1);
+  // Zero copies is a rated 0, never a rounding error below 0 that reads as unrated (e.g. 480 views).
+  for (let views = 20; views <= 2000; views += 1) assert.equal(installRateScore(plugin("unused"), { views, copies: 0 }), 0);
+  assert.equal(installRateScore(plugin("capped"), { views: 40, copies: 55 }), installRateScore(plugin("full"), { views: 40, copies: 40 }));
+  const plugins = [plugin("lucky"), plugin("solid"), plugin("popular"), plugin("unrated"), plugin("manual", { installCommand: "" })];
+  const stats = {
+    lucky: { views: 20, copies: 10 },
+    solid: { views: 297, copies: 161 },
+    popular: { views: 21177, copies: 8281 },
+    unrated: { views: 5, copies: 5 },
+    manual: { views: 900, copies: 0 },
+  };
+  assert.deepEqual([...plugins].sort((a, b) => comparePluginInstallRate(a, b, stats)).map((entry) => entry.id), ["solid", "popular", "lucky", "manual", "unrated"]);
+});
+
+test("hidden gems are verified, less-seen plugins with a screenshot, ordered by install rate", () => {
+  const gem = (id, extra = {}) => ({ id, name: id, installCommand: `omarchy plugin add ${id}`, verificationStatus: "verified", previewThumbnail: `assets/img/plugins/${id}-card.webp`, ...extra });
+  const plugins = [gem("popular"), gem("strong"), gem("good"), gem("unverified", { verificationStatus: "unverified" }), gem("no-shot", { previewThumbnail: "" }), gem("quiet"), gem("built-in", { builtIn: true })];
+  const stats = {
+    popular: { views: 9000, copies: 5000 },
+    strong: { views: 240, copies: 130 },
+    good: { views: 200, copies: 90 },
+    unverified: { views: 250, copies: 200 },
+    "no-shot": { views: 250, copies: 200 },
+    quiet: { views: 10, copies: 10 },
+    "built-in": { views: 100, copies: 90 },
+  };
+  assert.deepEqual(selectHiddenGems(plugins, stats).map((plugin) => plugin.id), ["strong", "good"]);
+  // Rated: good .45, strong .542, popular .556, unverified .8, no-shot .8 → median .556 (5000/9000).
+  assert.equal(medianInstallRate(plugins, stats), 5000 / 9000);
+  assert.equal(medianInstallRate([], stats), null);
+  // A plugin with views but no copies counts as a rated 0.
+  assert.equal(medianInstallRate([plugins[0], { ...plugins[0], id: "zero" }], { ...stats, zero: { views: 480, copies: 0 } }), (5000 / 9000) / 2);
+  assert.equal(selectHiddenGems([], stats).length, 0);
+});
+
+test("recent listings are newest first and age labels are compact", () => {
+  const now = Date.parse("2026-09-23T12:00:00Z");
+  const listing = (id, hoursAgo, extra = {}) => ({ id, name: id, listedAt: new Date(now - hoursAgo * 60 * 60 * 1000).toISOString(), ...extra });
+  const plugins = [
+    listing("fresh", 1),
+    listing("older", 20),
+    listing("same-time-b", 5),
+    listing("same-time-a", 5),
+    listing("too-old", 30),
+    listing("built-in", 2, { builtIn: true }),
+    listing("placeholder", 2, { placeholder: true }),
+    listing("official", 2, { sourceType: "builtin" }),
+  ];
+  assert.deepEqual(recentListings(plugins, now, 24).map((plugin) => plugin.id), ["fresh", "same-time-a", "same-time-b", "older"]);
+  assert.equal(listingAgeLabel({ listedAt: "2026-09-23T11:59:40Z" }, now), "just now");
+  assert.equal(listingAgeLabel({ listedAt: "2026-09-23T11:15:00Z" }, now), "45m ago");
+  assert.equal(listingAgeLabel({ listedAt: "2026-09-23T07:00:00Z" }, now), "5h ago");
+  assert.equal(listingAgeLabel({ listedAt: "2026-09-21T11:00:00Z" }, now), "2d ago");
+  assert.equal(listingAgeLabel({ listedAt: "2026-09-23T13:00:00Z" }, now), "");
+});
+
+test("recently added badges use a 12-hour listing window", () => {
+  const now = Date.parse("2026-07-28T12:00:00Z");
+  assert.equal(isRecentlyAdded({ listedAt: "2026-07-28T00:00:00.001Z" }, now), true);
+  assert.equal(isRecentlyAdded({ listedAt: "2026-07-28T00:00:00.000Z" }, now), false);
+  assert.equal(isRecentlyAdded({ listedAt: "2026-07-28T12:00:00.001Z" }, now), false);
+  assert.equal(isRecentlyAdded({ listedAt: "2026-07-28T11:00:00.000Z", placeholder: true }, now), false);
+  assert.equal(isRecentlyAdded({ listedAt: "2026-07-28T11:00:00.000Z", builtIn: true }, now), false);
 });
 
 test("recently added ordering uses the exact listing time", () => {
@@ -358,7 +542,7 @@ test("recent activity uses the newest valid plugin timestamp", () => {
   );
 });
 
-test("manifest version changes create a three-day updated state", () => {
+test("manifest version changes create a 12-hour updated state", () => {
   const detectedAt = "2026-07-28T12:00:00.000Z";
   const plugins = [
     { id: "new-plugin", version: "1.0.0" },
@@ -384,17 +568,615 @@ test("manifest version changes create a three-day updated state", () => {
   assert.equal(
     isRecentlyUpdated(
       result.find((plugin) => plugin.id === "updated-plugin"),
-      Date.parse("2026-07-30T11:59:59.000Z"),
+      Date.parse("2026-07-28T23:59:59.999Z"),
     ),
     true,
   );
   assert.equal(
     isRecentlyUpdated(
       result.find((plugin) => plugin.id === "updated-plugin"),
-      Date.parse("2026-07-31T12:00:00.000Z"),
+      Date.parse("2026-07-29T00:00:00.000Z"),
     ),
     false,
   );
+});
+
+test("catalog refresh failures identify the safe repository slug and error code", () => {
+  assert.equal(
+    catalogRefreshFailureMessage(
+      "https://github.com/example/weather",
+      new CatalogCheckError("repository-unreachable", "token and upstream detail stay private"),
+    ),
+    "Catalog source refresh failed for example/weather [repository-unreachable].",
+  );
+  assert.equal(
+    catalogRefreshFailureMessage(
+      "https://github.com/omacom-io/omarchy",
+      new CatalogCheckError("manifest-invalid", "private detail"),
+      { builtIn: true },
+    ),
+    "Built-in catalog refresh failed for omacom-io/omarchy [manifest-invalid].",
+  );
+  assert.equal(
+    catalogRefreshFailureMessage(
+      "https://github.com/example/weather",
+      new Error("token and upstream detail stay private"),
+      { fatal: true },
+    ),
+    "Catalog source refresh aborted for example/weather [internal-error: Error].",
+  );
+  assert.equal(
+    catalogRefreshFailureMessage(
+      "https://github.com/example/weather",
+      new CatalogBuildError("rate-limit-exhausted", "private detail"),
+      { fatal: true },
+    ),
+    "Catalog source refresh aborted for example/weather [rate-limit-exhausted].",
+  );
+  const disguised = new TypeError("private detail");
+  disguised.name = "Type\n::warning::Error";
+  assert.equal(
+    catalogRefreshFailureMessage(
+      "https://github.com/omacom-io/omarchy",
+      disguised,
+      { builtIn: true, fatal: true },
+    ),
+    "Built-in catalog refresh aborted for omacom-io/omarchy [internal-error: Type---warning--Error].",
+  );
+});
+
+test("approval catalog plans refresh only the exact approved source", () => {
+  const registry = {
+    sources: [
+      { repo: "https://github.com/example/one" },
+      { repo: "https://github.com/Example/Two.git" },
+      { repo: "https://github.com/example/three" },
+    ],
+  };
+  const full = catalogSourcePlan(registry);
+  assert.equal(full.incremental, false);
+  assert.deepEqual(full.refreshSources, registry.sources);
+
+  const approved = catalogSourcePlan(registry, "example/two");
+  assert.equal(approved.incremental, true);
+  assert.equal(approved.approvedSource, registry.sources[1]);
+  assert.deepEqual(approved.refreshSources, [registry.sources[1]]);
+  assert.throws(
+    () => catalogSourcePlan(registry, "example/missing"),
+    /is not registered/,
+  );
+});
+
+test("full refreshes preserve release metadata without optional GitHub API requests", async () => {
+  const repository = "https://github.com/example/target";
+  const release = {
+    tag: "v1.2.3",
+    url: "https://github.com/example/target/releases/tag/v1.2.3",
+    publishedAt: "2026-08-15T09:30:00.000Z",
+  };
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = async () => {
+    requestCount += 1;
+    throw new Error("Full refresh attempted an optional release request");
+  };
+
+  try {
+    const result = await repositoryReleaseForRefresh(
+      {},
+      { repo: repository },
+      [
+        { repo: "https://github.com/example/foreign", repositoryRelease: { tag: "v9" } },
+        { repo: repository, repositoryRelease: { ...release, ignored: "not preserved" } },
+      ],
+      false,
+    );
+    assert.deepEqual(result, release);
+    assert.equal(requestCount, 0);
+    assert.equal(
+      await repositoryReleaseForRefresh({}, { repo: repository }, [], false),
+      undefined,
+    );
+    assert.equal(
+      await repositoryReleaseForRefresh(
+        {},
+        { repo: repository },
+        [{
+          repo: repository,
+          repositoryRelease: {
+            tag: "v1.2.3",
+            url: "https://github.com/example/foreign/releases/tag/v1.2.3",
+          },
+        }],
+        false,
+      ),
+      undefined,
+    );
+    assert.equal(
+      await repositoryReleaseForRefresh(
+        {},
+        { repo: repository },
+        [{
+          repo: repository,
+          repositoryRelease: {
+            tag: "\ud800",
+            url: "https://github.com/example/target/tree/invalid",
+          },
+        }],
+        false,
+      ),
+      undefined,
+    );
+    const maximumTag = "a".repeat(256);
+    assert.deepEqual(
+      await repositoryReleaseForRefresh(
+        {},
+        { repo: repository },
+        [{
+          repo: repository,
+          repositoryRelease: {
+            tag: maximumTag,
+            url: `https://github.com/example/target/tree/${maximumTag}`,
+            publishedAt: `${"0".repeat(1_000)}2026-08-15T09:30:00Z`,
+          },
+        }],
+        false,
+      ),
+      {
+        tag: maximumTag,
+        url: `https://github.com/example/target/tree/${maximumTag}`,
+      },
+    );
+    assert.equal(
+      await repositoryReleaseForRefresh(
+        {},
+        { repo: repository },
+        [{
+          repo: repository,
+          repositoryRelease: {
+            tag: "a".repeat(257),
+            url: `https://github.com/example/target/tree/${"a".repeat(257)}`,
+          },
+        }],
+        false,
+      ),
+      undefined,
+    );
+    const astralTag = "v1-😀";
+    assert.deepEqual(
+      await repositoryReleaseForRefresh(
+        {},
+        { repo: repository },
+        [{
+          repo: repository,
+          repositoryRelease: {
+            tag: astralTag,
+            url: `https://github.com/example/target/tree/${encodeURIComponent(astralTag)}`,
+          },
+        }],
+        false,
+      ),
+      {
+        tag: astralTag,
+        url: `https://github.com/example/target/tree/${encodeURIComponent(astralTag)}`,
+      },
+    );
+    for (const bidiTag of ["v1-\u202e", "v1-\u2066"]) {
+      assert.equal(
+        await repositoryReleaseForRefresh(
+          {},
+          { repo: repository },
+          [{
+            repo: repository,
+            repositoryRelease: {
+              tag: bidiTag,
+              url: `https://github.com/example/target/tree/${encodeURIComponent(bidiTag)}`,
+            },
+          }],
+          false,
+        ),
+        undefined,
+      );
+    }
+    assert.equal(requestCount, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("incremental release refreshes preserve safe metadata after temporary API failures", async () => {
+  const repositoryUrl = "https://github.com/example/target";
+  const source = { repo: repositoryUrl };
+  const repository = parseGitHubRepository(repositoryUrl);
+  const release = {
+    tag: "v1.2.3",
+    url: "https://github.com/example/target/releases/tag/v1.2.3",
+    publishedAt: "2026-08-15T09:30:00Z",
+  };
+  const previousPlugins = [{ repo: repositoryUrl, repositoryRelease: release }];
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async () => new Response(null, { status: 500 });
+    assert.deepEqual(
+      await repositoryReleaseForRefresh(
+        { repository },
+        source,
+        previousPlugins,
+        true,
+      ),
+      release,
+    );
+
+    globalThis.fetch = async () => new Response(null, {
+      status: 403,
+      headers: {
+        "x-ratelimit-limit": "5000",
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-reset": "1787723664",
+      },
+    });
+    await assert.rejects(
+      repositoryReleaseForRefresh({ repository }, source, previousPlugins, true),
+      (error) => error instanceof CatalogBuildError && error.code === "rate-limit-exhausted",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("full catalog builds reserve GitHub API requests for exact snapshot checks", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "marketplace-full-refresh-"));
+  const registryPath = join(directory, "registry.json");
+  const catalogPath = join(directory, "site/catalog.json");
+  const previewDirectory = join(directory, "site/assets/img/plugins");
+  const targetRepo = "https://github.com/example/target";
+  const targetCommit = "a".repeat(40);
+  const treeSha = "b".repeat(40);
+  const release = {
+    tag: "v1.2.3",
+    url: "https://github.com/example/target/releases/tag/v1.2.3",
+    publishedAt: "2026-08-15T09:30:00Z",
+  };
+  const source = {
+    repo: targetRepo,
+    type: "plugin-source",
+    addedAt: "2026-08-15",
+    listedAt: "2026-08-15T10:00:00.000Z",
+    listingValidatedCommit: targetCommit,
+    listingValidatedAt: "2026-08-15T10:00:00.000Z",
+    listingValidatedBranch: "main",
+    automatedSecurityBaseline: {
+      version: securityBaselineVersion,
+      commit: targetCommit,
+      checkedAt: "2026-08-15T10:00:00.000Z",
+      outcome: "passed",
+      enforcementMode: securityBaselineEnforcementMode,
+      findings: [],
+      capabilities: [],
+    },
+    plugins: {
+      "example.target": {
+        category: "Desktop",
+        tags: ["overlay"],
+      },
+    },
+  };
+  const previous = {
+    generatedAt: "2026-08-15T09:00:00.000Z",
+    stateSchemaVersion: 2,
+    mode: "production",
+    plugins: [{
+      id: "example.target",
+      repo: targetRepo,
+      version: "1.0.0",
+      repositoryRelease: release,
+    }],
+    warnings: [],
+  };
+  const manifest = {
+    schemaVersion: 1,
+    id: "example.target",
+    name: "Target",
+    version: "1.0.0",
+    author: "Example",
+    description: "Target plugin",
+    license: "MIT",
+    kinds: ["overlay"],
+    entryPoints: { overlay: "Main.qml" },
+  };
+  const requestUrls = [];
+  const originalFetch = globalThis.fetch;
+  await mkdir(previewDirectory, { recursive: true });
+  await writeFile(registryPath, `${JSON.stringify({
+    sources: [source],
+    builtInSources: [],
+    placeholders: [],
+  }, null, 2)}\n`);
+  await writeFile(catalogPath, `${JSON.stringify(previous, null, 2)}\n`);
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    requestUrls.push(url);
+    if (url === "https://api.github.com/graphql") {
+      const request = JSON.parse(init.body);
+      if (request.query.includes("CatalogRefreshBudget")) {
+        return new Response(JSON.stringify({
+          data: { rateLimit: { cost: 1, limit: 5000, remaining: 4999, resetAt: "2026-08-15T11:00:00Z" } },
+        }), { status: 200 });
+      }
+      assert.match(request.query, /CatalogRefreshIdentities/);
+      assert.deepEqual(request.variables, {
+        owner0: "example",
+        name0: "target",
+        ref0: "refs/heads/__marketplace_default_branch_not_configured__",
+      });
+      return new Response(JSON.stringify({
+        data: {
+          r0: {
+            id: "R_kgDOExample",
+            databaseId: 123456789,
+            nameWithOwner: "example/target",
+            isArchived: false,
+            isDisabled: false,
+            isPrivate: false,
+            stargazerCount: 7,
+            pushedAt: "2026-08-15T09:30:00.000Z",
+            updatedAt: "2026-08-15T09:30:00.000Z",
+            defaultBranchRef: {
+              name: "main",
+              target: { oid: targetCommit, tree: { oid: treeSha } },
+            },
+            configuredRef: null,
+          },
+          rateLimit: { cost: 1, limit: 5000, remaining: 4998, resetAt: "2026-08-15T11:00:00Z" },
+        },
+      }), { status: 200 });
+    }
+    if (url === "https://api.github.com/rate_limit") {
+      return new Response(JSON.stringify({
+        resources: { core: { limit: 5000, remaining: 4998, reset: 1786788000 } },
+      }), { status: 200 });
+    }
+    if (url === `https://api.github.com/repos/example/target/git/trees/${treeSha}?recursive=1`) {
+      return new Response(JSON.stringify({
+        truncated: false,
+        tree: [
+          { path: "README.md", type: "blob", mode: "100644", size: 10 },
+          { path: "LICENSE", type: "blob", mode: "100644", size: 10 },
+          { path: "manifest.json", type: "blob", mode: "100644", size: 200 },
+          { path: "Main.qml", type: "blob", mode: "100644", size: 10 },
+        ],
+      }), { status: 200 });
+    }
+    if (url === `https://raw.githubusercontent.com/example/target/${targetCommit}/manifest.json`) {
+      const body = JSON.stringify(manifest);
+      return new Response(body, {
+        status: 200,
+        headers: { "content-length": String(Buffer.byteLength(body)) },
+      });
+    }
+    throw new Error(`Unexpected fixture request: ${url}`);
+  };
+
+  try {
+    await buildCatalog({ registryPath, catalogPath, previewDirectory });
+    const result = JSON.parse(await readFile(catalogPath, "utf8"));
+    const target = result.plugins.find((plugin) => plugin.id === "example.target");
+    assert.equal(target?.upstreamObservedCommit, targetCommit);
+    assert.equal(target?.upstreamValidatedCommit, targetCommit);
+    assert.deepEqual(target?.repositoryRelease, release);
+    assert.deepEqual(
+      requestUrls.filter((url) => url.startsWith("https://api.github.com/")),
+      [
+        "https://api.github.com/graphql",
+        "https://api.github.com/graphql",
+        "https://api.github.com/rate_limit",
+        `https://api.github.com/repos/example/target/git/trees/${treeSha}?recursive=1`,
+      ],
+    );
+    assert.deepEqual(currentCatalogApiUsage(), {
+      graphqlRequests: 2,
+      graphqlPoints: 2,
+      rawRequests: 1,
+      restOtherRequests: 0,
+      restRateLimitRequests: 1,
+      restTreeRequests: 1,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("incremental approval builds preserve unrelated catalog and preview state", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "marketplace-incremental-"));
+  const registryPath = join(directory, "registry.json");
+  const catalogPath = join(directory, "site/catalog.json");
+  const previewDirectory = join(directory, "site/assets/img/plugins");
+  const targetRepo = "https://github.com/example/target";
+  const targetCommit = "a".repeat(40);
+  const treeSha = "b".repeat(40);
+  const foreignPlugin = {
+    id: "example.foreign",
+    name: "Foreign",
+    repo: "https://github.com/example/foreign",
+    sourceType: "community",
+    verificationStatus: "unverified",
+    verificationSnapshotStatus: "unverified",
+    verificationCoverage: "unverified",
+    previewImage: "assets/img/plugins/foreign-detail.webp",
+    previewThumbnail: "assets/img/plugins/foreign-card.webp",
+  };
+  const registry = {
+    sources: [
+      {
+        repo: foreignPlugin.repo,
+        type: "plugin-source",
+        plugins: { [foreignPlugin.id]: {} },
+      },
+      {
+        repo: targetRepo,
+        type: "plugin-source",
+        addedAt: "2026-08-15",
+        listedAt: "2026-08-15T10:00:00.000Z",
+        listingValidatedCommit: targetCommit,
+        listingValidatedAt: "2026-08-15T10:00:00.000Z",
+        listingValidatedBranch: "main",
+        automatedSecurityBaseline: {
+          version: securityBaselineVersion,
+          commit: targetCommit,
+          checkedAt: "2026-08-15T10:00:00.000Z",
+          outcome: "passed",
+          enforcementMode: securityBaselineEnforcementMode,
+          findings: [],
+          capabilities: [],
+        },
+        plugins: {
+          "example.target": {
+            category: "Desktop",
+            tags: ["overlay"],
+          },
+        },
+      },
+    ],
+    builtInSources: [],
+    placeholders: [],
+  };
+  const previous = {
+    generatedAt: "2026-08-15T09:00:00.000Z",
+    stateSchemaVersion: 1,
+    mode: "production",
+    plugins: [foreignPlugin],
+    warnings: [
+      "foreign warning remains byte-for-byte",
+      `${targetRepo}: stale target warning`,
+    ],
+  };
+  const manifest = {
+    schemaVersion: 1,
+    id: "example.target",
+    name: "Target",
+    version: "1.0.0",
+    author: "Example",
+    description: "Target plugin",
+    license: "MIT",
+    kinds: ["overlay"],
+    entryPoints: { overlay: "Main.qml" },
+  };
+  const apiUrls = [];
+  const originalFetch = globalThis.fetch;
+  await mkdir(previewDirectory, { recursive: true });
+  await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
+  await writeFile(catalogPath, `${JSON.stringify(previous, null, 2)}\n`);
+  await writeFile(join(previewDirectory, "foreign-card.webp"), "foreign-card-bytes");
+  await writeFile(join(previewDirectory, "foreign-detail.webp"), "foreign-detail-bytes");
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    apiUrls.push(url);
+    if (url === "https://api.github.com/repos/example/target") {
+      return new Response(JSON.stringify({
+        private: false,
+        disabled: false,
+        archived: false,
+        default_branch: "main",
+        stargazers_count: 7,
+        pushed_at: "2026-08-15T09:30:00.000Z",
+      }), { status: 200 });
+    }
+    if (url === `https://api.github.com/repos/example/target/commits/${targetCommit}`) {
+      return new Response(JSON.stringify({
+        sha: targetCommit,
+        commit: { tree: { sha: treeSha } },
+      }), { status: 200 });
+    }
+    if (url === `https://api.github.com/repos/example/target/git/trees/${treeSha}?recursive=1`) {
+      return new Response(JSON.stringify({
+        truncated: false,
+        tree: [
+          { path: "README.md", type: "blob", mode: "100644", size: 10 },
+          { path: "LICENSE", type: "blob", mode: "100644", size: 10 },
+          { path: "manifest.json", type: "blob", mode: "100644", size: 200 },
+          { path: "Main.qml", type: "blob", mode: "100644", size: 10 },
+        ],
+      }), { status: 200 });
+    }
+    if (url === "https://api.github.com/repos/example/target/releases/latest") {
+      return new Response("not found", { status: 404 });
+    }
+    if (url === "https://api.github.com/repos/example/target/tags?per_page=1") {
+      return new Response(JSON.stringify([{ name: "v2.0.0" }]), { status: 200 });
+    }
+    if (url === `https://raw.githubusercontent.com/example/target/${targetCommit}/manifest.json`) {
+      return new Response(JSON.stringify(manifest), {
+        status: 200,
+        headers: { "content-length": String(Buffer.byteLength(JSON.stringify(manifest))) },
+      });
+    }
+    throw new Error(`Unexpected fixture request: ${url}`);
+  };
+
+  try {
+    await buildCatalog({
+      registryPath,
+      catalogPath,
+      previewDirectory,
+      approvedRepository: "example/target",
+      approvedCommit: targetCommit,
+    });
+    const result = JSON.parse(await readFile(catalogPath, "utf8"));
+    assert.deepEqual(result.plugins.find((plugin) => plugin.id === foreignPlugin.id), foreignPlugin);
+    const verifiedTarget = result.plugins.find((plugin) => plugin.id === "example.target");
+    assert.equal(verifiedTarget?.repo, targetRepo);
+    assert.equal(verifiedTarget?.verificationStatus, "verified");
+    assert.equal(verifiedTarget?.verificationCommit, targetCommit);
+    assert.deepEqual(verifiedTarget?.repositoryRelease, {
+      tag: "v2.0.0",
+      url: "https://github.com/example/target/tree/v2.0.0",
+    });
+    assert.deepEqual(result.warnings, ["foreign warning remains byte-for-byte"]);
+    assert.equal(await readFile(join(previewDirectory, "foreign-card.webp"), "utf8"), "foreign-card-bytes");
+    assert.equal(await readFile(join(previewDirectory, "foreign-detail.webp"), "utf8"), "foreign-detail-bytes");
+    assert.equal(apiUrls.filter((url) => url.startsWith("https://api.github.com/")).length, 5);
+    assert.ok(apiUrls.every((url) => !url.includes("example/foreign")));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("GitHub API limits abort catalog builds instead of degrading sources", () => {
+  const reset = "1786705200";
+  const exhausted = githubApiFailure(new Response(null, {
+    status: 403,
+    headers: {
+      "x-ratelimit-limit": "1000",
+      "x-ratelimit-remaining": "0",
+      "x-ratelimit-reset": reset,
+    },
+  }));
+  assert.ok(exhausted instanceof CatalogBuildError);
+  assert.equal(exhausted.code, "rate-limit-exhausted");
+  assert.match(exhausted.message, /limit 1000/);
+  assert.match(exhausted.message, /remaining 0/);
+  assert.match(exhausted.message, new RegExp(`reset ${reset}`));
+  assert.equal(catalogErrorCode(exhausted), "rate-limit-exhausted");
+  assert.equal(upstreamCheckErrorCodes.includes("rate-limit-exhausted"), false);
+  assert.throws(() => assertRecoverableCatalogError(exhausted), (error) => error === exhausted);
+
+  const throttled = githubApiFailure(new Response(null, {
+    status: 429,
+    headers: { "retry-after": "60" },
+  }));
+  assert.equal(throttled.code, "rate-limit-exhausted");
+  assert.match(throttled.message, /retryAfter 60s/);
+
+  const forbidden = githubApiFailure(new Response(null, {
+    status: 403,
+    headers: { "x-ratelimit-remaining": "42" },
+  }));
+  assert.equal(forbidden.code, "github-api-forbidden");
+  assert.throws(() => assertRecoverableCatalogError(forbidden), (error) => error === forbidden);
+  assert.equal(githubApiFailure(new Response(null, { status: 404 })), null);
 });
 
 test("upstream checks preserve last-known-good state across failures", () => {
@@ -416,6 +1198,14 @@ test("upstream checks preserve last-known-good state across failures", () => {
     upstreamValidatedCommit: "b".repeat(40),
     upstreamValidatedAt: "2026-07-28T11:00:00.000Z",
     upstreamCheckStatus: "passed",
+    verificationStatus: "verified",
+    verificationBaselineVersion: securityBaselineVersion,
+    verificationCommit: source.listingValidatedCommit,
+    verificationCheckedAt: "2026-07-28T10:30:00.000Z",
+    repositoryRelease: {
+      tag: "v1.0.0",
+      url: "https://github.com/example/foreign/releases/tag/v1.0.0",
+    },
   };
   const failed = failedSourcePlugins(
     source,
@@ -428,6 +1218,11 @@ test("upstream checks preserve last-known-good state across failures", () => {
   assert.equal(failed.upstreamValidatedCommit, "b".repeat(40));
   assert.equal(failed.upstreamCheckStatus, "failed");
   assert.equal(failed.installAvailable, false);
+  assert.equal(failed.verificationStatus, "unverified");
+  assert.equal(failed.verificationBaselineVersion, undefined);
+  assert.equal(failed.verificationCommit, undefined);
+  assert.equal(failed.verificationCheckedAt, undefined);
+  assert.equal(failed.repositoryRelease, undefined);
 
   const unreachable = failedSourcePlugins(
     source,
@@ -440,6 +1235,8 @@ test("upstream checks preserve last-known-good state across failures", () => {
   assert.equal(unreachable.upstreamValidatedCommit, "b".repeat(40));
   assert.equal(unreachable.upstreamCheckStatus, "unreachable");
   assert.equal(unreachable.installAvailable, true);
+  assert.equal(unreachable.verificationStatus, "unverified");
+  assert.equal(unreachable.verificationCommit, undefined);
   assert.equal(
     unreachable.installCommand,
     "omarchy plugin add https://github.com/example/weather.git --enable",
@@ -546,9 +1343,23 @@ test("successful checks bind observed and validated state to one snapshot", () =
   };
   const source = {
     repo: plugin.repo,
+    type: "plugin-source",
     listingValidatedCommit: "a".repeat(40),
     listingValidatedAt: "2026-07-28T10:00:00.000Z",
     listingValidatedBranch: "main",
+    automatedSecurityBaseline: {
+      schemaVersion: 1,
+      version: securityBaselineVersion,
+      repository: "example/weather",
+      pluginIds: [plugin.id],
+      commit: "a".repeat(40),
+      checkedAt: "2026-07-28T10:30:00.000Z",
+      outcome: "passed",
+      enforcementMode: securityBaselineEnforcementMode,
+      findings: [],
+      capabilities: [],
+    },
+    plugins: { [plugin.id]: {} },
   };
   const result = successfulState(
     plugin,
@@ -560,6 +1371,10 @@ test("successful checks bind observed and validated state to one snapshot", () =
   assert.equal(result.upstreamObservedCommit, sha);
   assert.equal(result.upstreamValidatedCommit, sha);
   assert.equal(result.upstreamCheckStatus, "passed");
+  assert.equal(result.verificationStatus, "unverified");
+  assert.equal(result.verificationSnapshotStatus, "verified");
+  assert.equal(result.verificationCoverage, "update-unverified");
+  assert.equal(result.verificationCommit, "a".repeat(40));
   assert.equal(result.versionUpdatedAt, "2026-07-28T12:00:00.000Z");
 });
 

@@ -1,54 +1,163 @@
 import {
   activityTime,
   accentColor,
+  appendCatalogViewState,
+  catalogViewControls,
+  comparePluginEngagement,
+  comparePluginInstallRate,
   copyText,
+  displayTaxonomyTag,
+  engagementRanks,
+  engagementSummary,
   escapeHtml,
+  formatDate,
+  formatEngagementCount,
   formatStars,
+  hidePendingEngagement,
   isRecentlyAdded,
   isRecentlyUpdated,
+  listingAgeLabel,
   listingTime,
   loadCatalog,
+  matchesVerificationStatus,
   paginationState,
+  pluginHeartButton,
+  pluginVersionLabel,
+  pluginVerificationState,
+  readCatalogView,
+  readCatalogViewState,
+  selectHiddenGems,
+  medianInstallRate,
+  recentListings,
+  setupControlTooltips,
   setupCopyButtons,
   setupThemeToggle,
-  starIcon
-} from "./shared.js?v=20260808-45";
+  showToast,
+  splitViewPageSize,
+  storeCatalogView,
+  updateEngagementSummary,
+  updatePluginHeart
+} from "./shared.js?v=20260930-01";
+import {
+  engagementApiBaseUrl,
+  hasPluginHeart,
+  loadEngagementStats,
+  recordPluginCopy,
+  recordPluginHeart,
+} from "./engagement.js?v=20260930-01";
 import {
   appendSearchState,
   committedTermsFromDraft,
   completionTarget,
   createSearchTerm,
   currentSearchToken,
+  foldSearchTerm,
   fuzzyScore,
   handleSearchEscape,
+  hasFulltextSearchDraft,
   inlineSearchCompletionSuffix,
-  matchesCommittedSearchTerm,
-  matchesDraftSearchTerm,
-  matchesShortSearch,
+  matchesDirectSearch,
+  matchesSearchSelection,
   maximumSearchTerms,
+  pluginKindKey,
   normalizeSearchTerm,
   parseSearchDraft,
+  pluginSearchContext,
   readSearchState,
   removeSearchTermTypeFromDraft,
+  repositoryPublisher,
   searchKeyAction,
+  searchPhraseKey,
   searchTermDisplayValue,
+  searchTermInputValue,
   searchTermKey,
-  searchTokens,
   selectSearchCompletions,
-} from "./search.js?v=20260808-45";
+} from "./search.js?v=20260930-01";
+import {
+  catalogCategoryTotals,
+  matchesBarTaxonomy,
+  matchesKidsTaxonomy,
+  matchesVpnTaxonomy,
+} from "./taxonomy.js?v=20260930-01";
 
 const pluginsPerPage = 9;
+const splitViewRows = 3;
+const hiddenCardTags = new Set([
+  "bar",
+  "bar-widget",
+  "hyprland",
+  "menu",
+  "overlay",
+  "panel",
+  "quickshell",
+  "service",
+]);
+const cardCategoryNames = new Map([
+  ["Bar widgets", "Bars"],
+  ["Bars", "Bars"],
+  ["Developer Tools", "Dev"],
+  ["Productivity", "Product"],
+]);
+function taxonomyKey(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/s$/, "");
+}
 
+function cardTaxonomyLabels(plugin) {
+  const category = String(plugin.category || "").trim();
+  const categoryKey = taxonomyKey(category);
+  const specific = [];
+
+  for (const tag of plugin.tags || []) {
+    if (hiddenCardTags.has(tag)) continue;
+    const label = displayTaxonomyTag(tag);
+    const labelKey = taxonomyKey(label);
+    if (labelKey === categoryKey || specific.some((value) => taxonomyKey(value) === labelKey)) continue;
+    specific.push(label);
+  }
+
+  const displayCategory = category === "Widgets"
+    ? ""
+    : cardCategoryNames.get(category) || category;
+  const labels = [displayCategory, ...specific].filter(Boolean).slice(0, 2);
+  return labels.length ? labels : [category || "System"];
+}
+
+const engagementSorts = new Set(["views", "copies", "hearts", "rank", "installRate"]);
+const verificationFilters = new Set(["verified", "unverified"]);
+const taxonomyFilterTags = ["ai", "games", "security"];
+const taxonomyCatalogFilters = [
+  ["VPN", matchesVpnTaxonomy],
+  ["Bar", matchesBarTaxonomy],
+];
+const taxonomyCatalogFilterNames = new Set(taxonomyCatalogFilters.map(([value]) => value));
 const sortOptions = {
   community: [
     ["added", "Recently added"],
     ["updated", "Recent activity"],
     ["stars", "Most starred"],
-    ["name", "A–Z"]
+    ["views", "Most viewed"],
+    ["copies", "Most copied"],
+    ["hearts", "Most hearts"],
+    ["rank", "Top ranked"],
+    ["installRate", "Install rate"],
+    ["name", "A–Z"],
+    ["verified", "Verified"],
+    ["unverified", "Unverified"]
   ],
   builtin: [
     ["name", "A–Z"],
-    ["kind", "Plugin type"]
+    ["kind", "Plugin type"],
+    ["views", "Most viewed"],
+    ["copies", "Most copied"],
+    ["hearts", "Most hearts"],
+    ["rank", "Top ranked"],
+    ["installRate", "Install rate"],
+    ["verified", "Verified"],
+    ["unverified", "Unverified"]
   ]
 };
 
@@ -59,10 +168,18 @@ const state = {
   source: "community",
   category: "all",
   sort: "added",
-  page: 1
+  page: 1,
+  showAll: false,
+  view: "cards",
+  selected: "",
+  engagement: {},
+  engagementAuthoritative: {},
+  engagementEnabled: false,
+  engagementLoaded: false
 };
 
 const grid = document.querySelector("#plugin-grid");
+const catalogTitle = document.querySelector("#catalog-title");
 const count = document.querySelector("#plugin-count");
 const countLabel = document.querySelector("#plugin-count-label");
 const empty = document.querySelector("#empty-state");
@@ -82,7 +199,29 @@ const nextPage = document.querySelector("#page-next");
 const previousPageLabel = document.querySelector("#page-previous-label");
 const nextPageLabel = document.querySelector("#page-next-label");
 const pageSummary = document.querySelector("#page-summary");
-const pageAnnouncement = document.querySelector("#page-announcement");
+const viewToggle = document.querySelector("#catalog-view-toggle");
+const viewButton = document.querySelector("#catalog-view-button");
+const viewLabel = document.querySelector("#catalog-view-label");
+const viewDock = document.querySelector("#catalog-view-dock");
+const viewDockButton = document.querySelector("#catalog-view-dock-button");
+const viewMode = document.querySelector("#catalog-view-mode");
+const splitRoot = document.querySelector("#catalog-split");
+const splitGrid = document.querySelector("#split-grid");
+const splitPanelCount = document.querySelector("#split-panel-count");
+const splitCard = document.querySelector("#split-card");
+const splitStatsBody = document.querySelector("#split-stats-body");
+const splitStatsTotal = document.querySelector("#split-stats-total");
+const splitFilters = document.querySelector("#split-filters");
+const splitTopRank = document.querySelector("#split-top-rank");
+const splitPagePrevious = document.querySelector("#split-page-previous");
+const splitPageNext = document.querySelector("#split-page-next");
+const splitPageInput = document.querySelector("#split-page-input");
+const splitPageTotal = document.querySelector("#split-page-total");
+const categoryBar = document.querySelector(".category-bar");
+const clearFilters = document.querySelector("#clear-filters");
+const viewDockStatus = document.querySelector("#catalog-view-dock-status");
+const catalogResultStatus = document.querySelector("#catalog-result-status");
+let viewScrollFrame = 0;
 let searchCompletions = [];
 let activeSuggestion = -1;
 let searchBlurTimer = 0;
@@ -92,86 +231,35 @@ function sourcePlugins() {
 }
 
 function publisherLogin(plugin) {
-  try {
-    const url = new URL(plugin.repo);
-    if (url.hostname.toLowerCase() !== "github.com") return "";
-    return url.pathname.split("/").filter(Boolean)[0] || "";
-  } catch {
-    return "";
-  }
-}
-
-function pluginSearchText(plugin) {
-  const publisher = publisherLogin(plugin);
-  return [
-    plugin.name,
-    plugin.description,
-    plugin.author,
-    publisher,
-    `@${publisher}`,
-    plugin.id,
-    plugin.category,
-    plugin.kind,
-    ...(plugin.tags || [])
-  ].join(" ").toLocaleLowerCase();
-}
-
-function directPluginTokenMatch(plugin, token) {
-  if (token.startsWith("@")) {
-    const requested = token.slice(1).toLocaleLowerCase();
-    return publisherLogin(plugin).toLocaleLowerCase().startsWith(requested);
-  }
-  const text = pluginSearchText(plugin);
-  if (token.length > 3) return text.includes(token);
-  const primaryText = [plugin.name, plugin.id, ...(plugin.tags || [])].join(" ");
-  return matchesShortSearch(token, primaryText, text);
-}
-
-function directPluginMatch(plugin, value) {
-  const tokens = searchTokens(value);
-  return tokens.length === 0
-    || tokens.every((token) => directPluginTokenMatch(plugin, token));
+  return repositoryPublisher(plugin?.repo);
 }
 
 function pluginMatchesActiveSearch(plugin) {
-  const publisher = publisherLogin(plugin);
-  const primaryText = [plugin.name, plugin.id, ...(plugin.tags || [])].join(" ");
-  const searchText = pluginSearchText(plugin);
-  const hasTerms = state.terms.length > 0;
-  const draftTerms = parseSearchDraft(state.query);
-  if (!hasTerms && !draftTerms.length) return true;
-  const matchContext = {
-    publisher,
-    primaryText,
-    searchText,
-    tags: plugin.tags || [],
-    pluginName: plugin.name,
-    pluginId: plugin.id,
-  };
-  const matchesTerm = state.terms.some((term) =>
-    matchesCommittedSearchTerm(term, matchContext)
-  );
-  const textDraftTerms = draftTerms.filter((term) => term.type === "text");
-  const typedDraftTerms = draftTerms.filter((term) => term.type !== "text");
-  const matchesTextDraft = textDraftTerms.length > 0
-    && textDraftTerms.every((term) => directPluginMatch(plugin, term.value));
-  const matchesTypedDraft = typedDraftTerms.some((term) =>
-    matchesDraftSearchTerm(term, matchContext)
-  );
-  return matchesTerm || matchesTextDraft || matchesTypedDraft;
+  return matchesSearchSelection(pluginSearchContext(plugin), {
+    terms: state.terms,
+    draftTerms: parseSearchDraft(state.query),
+  });
 }
 
 function completionMatches(value) {
+  if (hasFulltextSearchDraft(value)) return [];
   const rawQuery = currentSearchToken(value);
-  const query = rawQuery.replace(/^@/, "").toLocaleLowerCase();
+  const query = foldSearchTerm(rawQuery.replace(/^@/, ""));
   if (!query) return [];
   const inputTokens = normalizeSearchTerm(value).split(" ");
   const pluginQueries = inputTokens.map((_, index) =>
-    inputTokens.slice(index).join(" ").toLocaleLowerCase()
+    foldSearchTerm(inputTokens.slice(index).join(" "))
   );
-  const plugins = sourcePlugins();
+  const plugins = searchScopePlugins();
+  const normalizedValue = normalizeSearchTerm(value);
+  const parsedDraft = parseSearchDraft(normalizedValue);
+  const fulltextTerm = parsedDraft.length
+    && parsedDraft.every((term) => term.type === "text")
+    && !/(?:^|\s)(?:tag|author|plugin|kind):/i.test(normalizedValue)
+    ? createSearchTerm("fulltext", normalizedValue)
+    : null;
   const hasDirectPluginMatch = plugins.some((plugin) =>
-    directPluginMatch(plugin, rawQuery)
+    matchesDirectSearch(rawQuery, pluginSearchContext(plugin))
   );
   const matches = new Map();
   const addMatch = ({
@@ -179,27 +267,38 @@ function completionMatches(value) {
     value: completionValue,
     label,
     insertValue,
+    matchValue = "",
     detail = "",
     count = 1,
   }) => {
     if (rawQuery.startsWith("@") && type !== "author") return;
-    const candidate = type === "author"
-      ? completionValue.replace(/^@/, "").toLocaleLowerCase()
-      : label.toLocaleLowerCase();
-    const completionQueries = type === "plugin" ? pluginQueries : [query];
-    const score = Math.min(...completionQueries.map((candidateQuery) =>
-      fuzzyScore(candidateQuery, candidate)
+    const candidates = type === "author"
+      ? [completionValue.replace(/^@/, "")]
+      : [label, matchValue].filter(Boolean);
+    const completionQueries = ["plugin", "kind"].includes(type) ? pluginQueries : [query];
+    const score = Math.min(...completionQueries.flatMap((candidateQuery) =>
+      candidates.map((candidate) => fuzzyScore(candidateQuery, candidate))
     ));
     if (!Number.isFinite(score) || (score >= 100 && hasDirectPluginMatch)) return;
-    const key = `${type}:${completionValue.toLocaleLowerCase()}`;
-    const suggestion = { type, value: completionValue, label, insertValue, detail };
+    const key = `${type}:${foldSearchTerm(completionValue)}`;
+    const suggestion = {
+      type, value: completionValue, label, insertValue, matchValue, detail,
+    };
     const target = completionTarget(suggestion);
-    const targetLower = target.toLocaleLowerCase();
-    const prefix = completionQueries.some((candidateQuery) =>
-      targetLower.startsWith(candidateQuery)
-    );
-    const fullPrefix = targetLower.startsWith(String(value || "").trim().toLocaleLowerCase());
-    const targetLength = target.length;
+    const rawTargets = [target, matchValue].filter(Boolean);
+    const targets = rawTargets.map(foldSearchTerm);
+    const targetKeys = rawTargets.map(searchPhraseKey).filter(Boolean);
+    const prefix = completionQueries.some((candidateQuery) => {
+      const candidateKey = searchPhraseKey(candidateQuery);
+      return targets.some((candidate) => candidate.startsWith(candidateQuery))
+        || (candidateKey && targetKeys.some((candidate) => candidate.startsWith(candidateKey)));
+    });
+    const normalizedInput = foldSearchTerm(value);
+    const normalizedInputKey = searchPhraseKey(value);
+    const fullPrefix = targets.some((candidate) => candidate.startsWith(normalizedInput))
+      || (normalizedInputKey
+        && targetKeys.some((candidate) => candidate.startsWith(normalizedInputKey)));
+    const targetLength = Math.min(...targets.map((candidate) => candidate.length));
     const current = matches.get(key);
     if (current) {
       current.count += count;
@@ -212,6 +311,42 @@ function completionMatches(value) {
     }
   };
 
+  const kinds = new Map();
+  plugins.forEach((plugin) => {
+    const key = pluginKindKey(plugin.kind);
+    if (!key) return;
+    const current = kinds.get(key);
+    if (current) {
+      current.count += 1;
+      current.ambiguous ||= current.label !== plugin.kind;
+    } else {
+      kinds.set(key, { label: plugin.kind, count: 1, ambiguous: false });
+    }
+  });
+  kinds.forEach(({ label, count: kindCount, ambiguous }, key) => {
+    if (ambiguous) return;
+    addMatch({
+      type: "kind",
+      value: key,
+      label: `kind:${key}`,
+      insertValue: `kind:${key}`,
+      matchValue: label,
+      detail: label,
+      count: kindCount,
+    });
+  });
+  if (fulltextTerm) {
+    addMatch({
+      type: "fulltext",
+      value: fulltextTerm.value,
+      label: fulltextTerm.value,
+      insertValue: searchTermInputValue(fulltextTerm),
+      detail: "broad search",
+      count: plugins.filter((plugin) =>
+        matchesDirectSearch(fulltextTerm.value, pluginSearchContext(plugin))
+      ).length,
+    });
+  }
   plugins.forEach((plugin) => {
     const login = publisherLogin(plugin);
     if (login && state.source === "community") {
@@ -289,9 +424,11 @@ function setActiveSuggestion(index) {
 
 const searchTermTypeLabels = {
   text: "",
+  fulltext: "TEXT",
   tag: "TAG",
   author: "AUTHOR",
   plugin: "PLUGIN",
+  kind: "KIND",
 };
 
 function searchTermPresentation(term) {
@@ -300,7 +437,10 @@ function searchTermPresentation(term) {
   const plugin = normalized.type === "plugin"
     ? state.plugins.find((item) => item.id === normalized.value)
     : null;
-  const value = plugin?.name || searchTermDisplayValue(normalized);
+  const kind = normalized.type === "kind"
+    ? state.plugins.find((item) => pluginKindKey(item.kind) === normalized.value)?.kind
+    : null;
+  const value = plugin?.name || kind || searchTermDisplayValue(normalized);
   return {
     term: normalized,
     value,
@@ -313,8 +453,8 @@ function updateSearchAffordances() {
   searchClear.hidden = !active;
   searchShortcut.hidden = active;
   search.placeholder = state.terms.length
-    ? "Add search term…"
-    : "Search plugins, tags, or @authors…";
+    ? "Narrow by another term…"
+    : "Search plugins, tag:panel, text:bar, or @author…";
 }
 
 function removeSearchTerm(index) {
@@ -326,7 +466,9 @@ function removeSearchTerm(index) {
   renderSearchTerms();
   render();
   search.focus();
-  searchSuggestionStatus.textContent = `Removed ${presentation.term.type} search term ${presentation.value}`;
+  searchSuggestionStatus.textContent = searchResultMessage(
+    `Removed ${presentation.term.type} search term ${presentation.value}`,
+  );
 }
 
 function renderSearchTerms() {
@@ -378,9 +520,9 @@ function commitSearchDraft(completion) {
   closeSearchSuggestions();
   renderSearchTerms();
   render();
-  searchSuggestionStatus.textContent = added.length
+  searchSuggestionStatus.textContent = searchResultMessage(added.length
     ? `Added search term${added.length === 1 ? "" : "s"} ${added.join(", ")}`
-    : "Those search terms are already active";
+    : "Those search terms are already active");
   return true;
 }
 
@@ -393,7 +535,25 @@ function clearSearchTerms({ focus = true } = {}) {
   renderSearchTerms();
   render();
   if (focus) search.focus();
-  searchSuggestionStatus.textContent = "Cleared all search terms";
+  searchSuggestionStatus.textContent = searchResultMessage("Cleared all search terms");
+}
+
+const searchSuggestionDelay = 80;
+let searchSuggestionTimer = 0;
+
+function scheduleSearchSuggestions() {
+  window.clearTimeout(searchSuggestionTimer);
+  searchSuggestionTimer = window.setTimeout(() => {
+    searchSuggestionTimer = 0;
+    updateSearchSuggestions();
+  }, searchSuggestionDelay);
+}
+
+function flushSearchSuggestions() {
+  if (!searchSuggestionTimer) return;
+  window.clearTimeout(searchSuggestionTimer);
+  searchSuggestionTimer = 0;
+  updateSearchSuggestions();
 }
 
 function updateSearchSuggestions() {
@@ -405,8 +565,9 @@ function updateSearchSuggestions() {
   }
   searchCompletions = completionMatches(search.value);
   activeSuggestion = -1;
+  search.removeAttribute("aria-activedescendant");
   const resultCount = filteredPlugins().length;
-  const summaryAction = state.terms.length ? "Add" : "Search for";
+  const summaryAction = state.terms.length ? "Narrow by" : "Search for";
   searchSuggestions.innerHTML = `
     <div class="search-query-summary" role="presentation" aria-hidden="true">
       <span>${summaryAction} “${escapeHtml(rawQuery)}”</span>
@@ -416,7 +577,7 @@ function updateSearchSuggestions() {
       <button id="search-completion-${index}" class="search-suggestion" type="button" role="option"
         tabindex="-1" aria-selected="false" data-search-completion="${index}">
         <span>${escapeHtml(completion.label)}</span>
-        <small>${completion.type}${completion.detail ? ` · ${escapeHtml(completion.detail)}` : ""}${completion.count > 1 ? ` · ${completion.count}` : ""}</small>
+        <small>${completion.type === "fulltext" ? "text" : completion.type}${completion.detail ? ` · ${escapeHtml(completion.detail)}` : ""}${completion.count > 1 ? ` · ${completion.count}` : ""}</small>
       </button>`).join("")}`;
   searchSuggestions.hidden = false;
   search.setAttribute("aria-expanded", "true");
@@ -441,20 +602,76 @@ function sourceDefaultSort(source = state.source) {
   return source === "builtin" ? "name" : "added";
 }
 
+function availableSortOptions(source = state.source) {
+  return sortOptions[source].filter(([value]) => (
+    state.engagementEnabled || !engagementSorts.has(value)
+  ));
+}
+
 function allCategoryLabel() {
   return state.source === "builtin" ? "All built-ins" : "All plugins";
 }
 
-function filteredPlugins() {
-  const result = sourcePlugins().filter((plugin) => (
-    (state.category === "all" || plugin.category === state.category)
-    && pluginMatchesActiveSearch(plugin)
-  ));
+function matchesCatalogFilter(plugin, filter = state.category) {
+  if (filter === "all") return true;
+  if (filter === "Kids") return matchesKidsTaxonomy(plugin);
+  for (const [value, matches] of taxonomyCatalogFilters) {
+    if (filter === value) return matches(plugin);
+  }
+  if (filter.startsWith("tag:")) return (plugin.tags || []).includes(filter.slice(4));
+  return plugin.category === filter;
+}
 
+function catalogFilterLabel(filter) {
+  if (filter.startsWith("tag:")) return displayTaxonomyTag(filter.slice(4));
+  return filter;
+}
+
+function searchScopePlugins() {
+  return sourcePlugins().filter((plugin) => (
+    matchesCatalogFilter(plugin)
+    && (!verificationFilters.has(state.sort) || matchesVerificationStatus(plugin, state.sort))
+  ));
+}
+
+let engagementVersion = 0;
+let filteredCache = { key: "", value: [] };
+let ranksCache = { key: "", value: new Map() };
+
+function rankedPlugins() {
+  return state.plugins.filter((plugin) => (plugin.sourceType || "community") === "community");
+}
+
+function catalogRanks() {
+  const key = `${state.plugins.length}:${engagementVersion}`;
+  if (ranksCache.key !== key) ranksCache = { key, value: engagementRanks(rankedPlugins(), state.engagement) };
+  return ranksCache.value;
+}
+
+function filteredPlugins() {
+  const key = JSON.stringify([
+    state.plugins.length, state.source, state.category, state.sort, state.terms, state.query, engagementVersion,
+  ]);
+  if (filteredCache.key === key) return filteredCache.value;
+  const value = computeFilteredPlugins();
+  filteredCache = { key, value };
+  return value;
+}
+
+function computeFilteredPlugins() {
+  const result = searchScopePlugins().filter((plugin) => pluginMatchesActiveSearch(plugin));
+
+  const ranks = state.sort === "rank" ? catalogRanks() : new Map();
   const sorters = {
     added: (a, b) => listingTime(b) - listingTime(a) || a.name.localeCompare(b.name),
     updated: (a, b) => activityTime(b) - activityTime(a) || a.name.localeCompare(b.name),
     stars: (a, b) => (b.stars || 0) - (a.stars || 0) || a.name.localeCompare(b.name),
+    views: (a, b) => comparePluginEngagement(a, b, state.engagement, "views"),
+    copies: (a, b) => comparePluginEngagement(a, b, state.engagement, "copies"),
+    hearts: (a, b) => comparePluginEngagement(a, b, state.engagement, "hearts"),
+    installRate: (a, b) => comparePluginInstallRate(a, b, state.engagement),
+    rank: (a, b) => (ranks.get(a.id)?.overall || Infinity) - (ranks.get(b.id)?.overall || Infinity)
+      || String(a.name || "").localeCompare(String(b.name || "")),
     name: (a, b) => a.name.localeCompare(b.name),
     kind: (a, b) => (a.kind || "").localeCompare(b.kind || "") || a.name.localeCompare(b.name)
   };
@@ -462,66 +679,255 @@ function filteredPlugins() {
   return result.sort(sorters[state.sort] || sorters[sourceDefaultSort()]);
 }
 
-function pluginCard(plugin, { showNew = false } = {}) {
-  const tags = (plugin.tags || []).slice(0, 2).map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("");
-  const badge = plugin.builtIn
-    ? '<span class="builtin-badge">Built-in</span>'
-    : plugin.placeholder
-      ? '<span class="status-badge">Coming soon</span>'
-      : "";
-  const activityBadge = showNew && isRecentlyUpdated(plugin)
-    ? '<span class="updated-badge">Updated</span>'
-    : showNew && isRecentlyAdded(plugin)
-      ? '<span class="new-badge">New</span>'
-      : "";
+function pluginEngagement(plugin) {
+  if (!state.engagementEnabled) return "";
+  return engagementSummary(plugin, state.engagement[plugin.id], {
+    pending: !state.engagementLoaded,
+  });
+}
+
+function pluginCardFocusToken(element = document.activeElement) {
+  const card = element?.closest?.("[data-card-plugin]");
+  if (!card || !(grid.contains(card) || splitCard.contains(card))) return null;
+  let control = "details";
+  if (element.matches?.("[data-plugin-heart]")) control = "heart";
+  else if (element.matches?.("[data-verification-tooltip]")) control = "verification";
+  else if (element.matches?.("[data-copy-command]")) control = "copy";
+  else if (element.matches?.(".plugin-author button")) control = "author";
+  else if (element.matches?.(".builtin-source-action")) control = "source";
+  return { pluginId: card.dataset.cardPlugin, control };
+}
+
+function restorePluginCardFocus(token) {
+  if (!token) return false;
+  const card = [...grid.querySelectorAll("[data-card-plugin]"), ...splitCard.querySelectorAll("[data-card-plugin]")]
+    .find((candidate) => candidate.dataset.cardPlugin === token.pluginId);
+  if (!card) return false;
+  const selectors = {
+    author: ".plugin-author button",
+    copy: "[data-copy-command]",
+    details: ".plugin-card-link",
+    heart: "[data-plugin-heart]",
+    source: ".builtin-source-action",
+    verification: "[data-verification-tooltip]",
+  };
+  const target = card.querySelector(selectors[token.control]) || card.querySelector(".plugin-card-link");
+  target?.focus({ preventScroll: true });
+  return Boolean(target);
+}
+
+function applyAuthoritativeEngagement(pluginId, result, {
+  focusToken = null,
+  sortMetric = "",
+} = {}) {
+  if (!result?.recorded || !result.stats) return;
+  const current = state.engagementAuthoritative[pluginId]
+    || state.engagement[pluginId]
+    || { views: 0, copies: 0, hearts: 0 };
+  const next = {
+    views: Math.max(current.views, result.stats.views),
+    copies: Math.max(current.copies, result.stats.copies),
+    hearts: Math.max(current.hearts, result.stats.hearts),
+  };
+  state.engagementAuthoritative[pluginId] = next;
+  state.engagement[pluginId] = next;
+  engagementVersion += 1;
+  updateEngagementSummary(document, pluginId, next);
+  updatePluginHeart(document, pluginId, next, {
+    hearted: hasPluginHeart(pluginId),
+  });
+  if (state.sort === sortMetric || state.sort === "rank") {
+    render();
+    if (!restorePluginCardFocus(focusToken) && focusToken) focusCatalogResult();
+  } else if (splitView()) {
+    refreshSplitRanks();
+  } else {
+    refreshCardRanks();
+  }
+}
+
+async function heartPlugin(button) {
+  if (button.getAttribute("aria-disabled") === "true" || button.dataset.heartSubmitting === "true") return;
+  const focusToken = pluginCardFocusToken(button);
+  button.dataset.heartSubmitting = "true";
+  button.setAttribute("aria-busy", "true");
+  const pluginId = button.dataset.pluginHeart;
+  const result = await recordPluginHeart(pluginId);
+  delete button.dataset.heartSubmitting;
+  button.removeAttribute("aria-busy");
+  if (!result?.recorded) {
+    showToast("Heart could not be sent. Try again.");
+    return;
+  }
+  applyAuthoritativeEngagement(pluginId, result, {
+    focusToken,
+    sortMetric: "hearts",
+  });
+  updatePluginHeart(document, pluginId, result.stats, {
+    animate: true,
+    hearted: true,
+  });
+  showToast("Heart sent.");
+}
+
+async function copyPluginCommand(button) {
+  const focusToken = pluginCardFocusToken(button);
+  if (!await copyText(button.dataset.copyCommand, button)) return;
+  const pluginId = button.dataset.pluginId;
+  applyAuthoritativeEngagement(
+    pluginId,
+    await recordPluginCopy(pluginId),
+    { focusToken, sortMetric: "copies" },
+  );
+}
+
+function verificationBadge(plugin) {
+  const verification = pluginVerificationState(plugin);
+  if (!verification) return "";
+  return `<span class="card-verification is-${verification.status}">
+    <button class="card-verification-trigger" type="button" data-verification-tooltip aria-expanded="false" aria-label="${escapeHtml(`${verification.label}. ${verification.explanation}`)}">
+      <span class="card-verification-marker">${escapeHtml(verification.label)}</span>
+    </button>
+    <span class="card-verification-tooltip" role="tooltip" aria-hidden="true">${escapeHtml(verification.explanation)}</span>
+  </span>`;
+}
+
+function closeVerificationTooltips(except = null) {
+  document.querySelectorAll("[data-verification-tooltip]").forEach((button) => {
+    if (button === except) return;
+    button.setAttribute("aria-expanded", "false");
+    const container = button.closest(".card-verification");
+    container?.classList.remove("is-open");
+    container?.classList.add("is-dismissed");
+  });
+}
+
+// Card badges shared by plugin cards and the Just landed rows.
+function cardBadges(plugin) {
   const installAction = plugin.builtIn
     ? `<a class="card-install builtin-source-action" href="${escapeHtml(plugin.sourceUrl || plugin.repo)}" target="_blank" rel="noreferrer" aria-label="View source for ${escapeHtml(plugin.name)}">View source ↗</a>`
     : plugin.placeholder
       ? '<span class="card-install unavailable" aria-label="Installation not yet available"><span class="command-glyph" aria-hidden="true"></span> Preview only</span>'
       : !plugin.installAvailable
-        ? `<span class="card-install unavailable" aria-label="Automatic installation unavailable"><span class="command-glyph" aria-hidden="true"></span> ${plugin.upstreamCheckStatus === "failed" ? "Unavailable" : "Manual setup"}</span>`
-        : `<button class="card-install" type="button" data-copy-command="${escapeHtml(plugin.installCommand)}" aria-label="Copy install command for ${escapeHtml(plugin.name)}">
+        ? `<span class="card-install unavailable" aria-label="Automatic installation unavailable"><span class="command-glyph" aria-hidden="true"></span> ${plugin.upstreamCheckStatus === "failed" ? "Unavailable" : "Manual"}</span>`
+        : `<button class="card-install has-control-tooltip" type="button" data-copy-command="${escapeHtml(plugin.installCommand)}" data-plugin-id="${escapeHtml(plugin.id)}" aria-label="Copy install command for ${escapeHtml(plugin.name)}">
           <span class="command-glyph" aria-hidden="true"></span><span data-copy-label>Copy install</span>
           <span class="copy-icon" aria-hidden="true"></span>
+          <span class="control-tooltip" role="tooltip" aria-hidden="true">Copy install command</span>
         </button>`;
+  const stars = plugin.builtIn ? "" : `<span class="card-stars has-control-tooltip" aria-label="${formatStars(plugin.stars)} repository stars"><svg class="social-glyph star-glyph" viewBox="0 0 14 14" aria-hidden="true"><path d="M7 .5 8.9 4.6l4.6.6-3.35 3.15L11 13 7 10.75 3 13l.85-4.65L.5 5.2l4.6-.6Z"/></svg><span class="social-count" aria-hidden="true">${formatStars(plugin.stars)}</span><span class="control-tooltip" role="tooltip" aria-hidden="true">Repository stars</span></span>`;
+  const hearted = hasPluginHeart(plugin.id);
+  const heart = state.engagementEnabled
+    ? pluginHeartButton(plugin, state.engagement[plugin.id], {
+        hearted,
+        pending: !state.engagementLoaded,
+      })
+    : "";
+  const rank = cardRankLabel(plugin);
+  const rankLine = state.engagementEnabled && !plugin.builtIn
+    ? `<span class="card-rank" data-card-rank="${escapeHtml(plugin.id)}" title="Overall rank from hearts, install copies, views, and repository stars"${rank ? "" : " hidden"}>${escapeHtml(rank)}</span>`
+    : "";
+  return { installAction, stars, heart, rankLine };
+}
+
+function pluginCard(plugin, { showNew = false, previewBack = "", gemTimes = null } = {}) {
+  const tags = cardTaxonomyLabels(plugin)
+    .map((label) => `<span class="tag">${escapeHtml(label)}</span>`)
+    .join("");
+  const badge = plugin.builtIn
+    ? '<span class="builtin-badge">Built-in</span>'
+    : plugin.placeholder
+      ? '<span class="status-badge">Coming soon</span>'
+      : "";
+  const activityState = showNew && isRecentlyUpdated(plugin)
+    ? '<span class="card-activity-state is-updated">Updated</span>'
+    : showNew && isRecentlyAdded(plugin)
+      ? '<span class="card-activity-state is-new">New</span>'
+      : "";
+  const verificationState = verificationBadge(plugin);
+  const cardStates = activityState || verificationState
+    ? `<div class="card-status-line">${activityState}${verificationState}</div>`
+    : "";
   const previewSource = plugin.previewThumbnail || plugin.previewImage;
   const preview = previewSource
     ? `<div class="plugin-preview image-preview"><img src="${escapeHtml(previewSource)}" alt="" width="${Number(plugin.previewThumbnailWidth || plugin.previewWidth) || 720}" height="${Number(plugin.previewThumbnailHeight || plugin.previewHeight) || 405}" loading="lazy"></div>`
     : `<div class="plugin-preview" aria-hidden="true">
         <span class="plugin-preview-mark">${escapeHtml(plugin.initials)}</span>
       </div>`;
-  const stars = plugin.builtIn ? "" : `<span class="card-stars" title="Repository stars">${starIcon()} ${formatStars(plugin.stars)}</span>`;
+  // Hidden gems: listing date and how many times as many install-command copies per detail view it gets as the median plugin.
+  const gemModule = gemTimes === null ? "" : `
+        <p class="card-gem-facts">
+          <span class="card-gem-since">Listed since ${escapeHtml(formatDate(plugin.listedAt || plugin.addedAt))}</span>
+          ${gemTimes ? `<span class="card-gem-times"><strong>${gemTimes}×</strong><span><span>as many install copies per view</span> <span>as most plugins</span></span></span>` : ""}
+        </p>`;
+  const previewFace = previewBack ? `<div class="plugin-preview-flip">${preview}${previewBack}</div>` : preview;
+  const { installAction, stars, heart, rankLine } = cardBadges(plugin);
+  const social = stars || heart || rankLine ? `<div class="card-social">${stars}${heart}${rankLine}</div>` : "";
   const publisher = publisherLogin(plugin);
   const authorLine = publisher && !plugin.builtIn
     ? `<span class="plugin-author">by <button type="button" data-author="${escapeHtml(publisher)}" aria-label="Show all plugins by @${escapeHtml(publisher)}">@${escapeHtml(publisher)}</button> · ${escapeHtml(plugin.kind || plugin.category)}</span>`
     : `<span class="plugin-author">by ${escapeHtml(plugin.author)} · ${escapeHtml(plugin.kind || plugin.category)}</span>`;
 
   return `
-    <article class="plugin-card${plugin.builtIn ? " built-in-card" : ""}" style="--card-accent:${accentColor(plugin.accent)}">
+    <article class="plugin-card${plugin.builtIn ? " built-in-card" : ""}" data-card-plugin="${escapeHtml(plugin.id)}" style="--card-accent:${accentColor(plugin.accent)}">
       <a class="plugin-card-link" href="plugin.html?id=${encodeURIComponent(plugin.id)}" aria-label="View ${escapeHtml(plugin.name)}"></a>
-      ${preview}
+      ${previewFace}
       <div class="plugin-card-body">
         <div class="plugin-card-content">
           <div class="plugin-title-line">
             <h3>${escapeHtml(plugin.name)}</h3>
             ${badge}
-            ${activityBadge}
-            ${stars}
+            ${social}
           </div>
           ${authorLine}
           <p class="plugin-description">${escapeHtml(plugin.description)}</p>
         </div>
+        ${gemModule}
+        ${cardStates}
         <div class="plugin-card-bottom">
           <div class="plugin-tags">${tags}</div>
-          ${installAction}
+          <div class="plugin-card-actions">
+            ${pluginEngagement(plugin)}
+            ${installAction}
+          </div>
         </div>
       </div>
     </article>`;
 }
 
 function bindCardActions(root) {
+  setupControlTooltips(root);
+  root.querySelectorAll("[data-verification-tooltip]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const expanded = button.getAttribute("aria-expanded") !== "true";
+      closeVerificationTooltips(button);
+      button.setAttribute("aria-expanded", String(expanded));
+      const container = button.closest(".card-verification");
+      container?.classList.toggle("is-open", expanded);
+      container?.classList.toggle("is-dismissed", !expanded);
+    });
+    button.addEventListener("focus", () => {
+      button.closest(".card-verification")?.classList.remove("is-dismissed");
+    });
+    button.addEventListener("pointerenter", () => {
+      button.closest(".card-verification")?.classList.remove("is-dismissed");
+    });
+    button.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      button.setAttribute("aria-expanded", "false");
+      const container = button.closest(".card-verification");
+      container?.classList.remove("is-open");
+      container?.classList.add("is-dismissed");
+      event.stopPropagation();
+    });
+  });
+  root.querySelectorAll("[data-plugin-heart]").forEach((button) => {
+    button.addEventListener("click", () => heartPlugin(button));
+  });
   root.querySelectorAll("[data-copy-command]").forEach((button) => {
-    button.addEventListener("click", () => copyText(button.dataset.copyCommand, button));
+    button.addEventListener("click", () => copyPluginCommand(button));
   });
   root.querySelectorAll("[data-author]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -548,23 +954,164 @@ function bindCardActions(root) {
   });
 }
 
+// Small Just landed card: image, name, author, landing time, and the overall rank once engagement loads.
+// Duplicates close the endless loop and are on screen when it starts, so they stay clickable; only screen readers and the tab order skip them.
+function landedCard(plugin, now, duplicate = false) {
+  const publisher = publisherLogin(plugin);
+  const byline = publisher ? `@${publisher}` : plugin.author || "Unknown";
+  const image = plugin.previewThumbnail || plugin.previewImage;
+  const media = image
+    ? `<img src="${escapeHtml(image)}" alt="" width="${Number(plugin.previewThumbnailWidth || plugin.previewWidth) || 720}" height="${Number(plugin.previewThumbnailHeight || plugin.previewHeight) || 405}" loading="lazy" decoding="async">`
+    : `<span class="landed-mark" aria-hidden="true">${escapeHtml(plugin.initials)}</span>`;
+  const rank = cardRankLabel(plugin);
+  return `
+    <li${duplicate ? ' aria-hidden="true"' : ""}><a class="landed-card" href="plugin.html?id=${encodeURIComponent(plugin.id)}"${duplicate ? ' tabindex="-1"' : ""} style="--card-accent:${accentColor(plugin.accent)}">
+      <span class="landed-media">${media}</span>
+      <span class="landed-body">
+        <span class="landed-name">${escapeHtml(plugin.name)}</span>
+        <span class="landed-author">${escapeHtml(byline)}</span>
+        <span class="landed-foot">
+          <time datetime="${escapeHtml(new Date(listingTime(plugin)).toISOString())}">${escapeHtml(listingAgeLabel(plugin, now))}</time>
+          <span class="landed-rank" data-card-rank="${escapeHtml(plugin.id)}"${rank ? "" : " hidden"}>${escapeHtml(rank)}</span>
+        </span>
+      </span>
+    </a></li>`;
+}
+
+
+// Back of a card preview (Recently added and the Cards view): the full description and the detail
+// page's Version, License, and Owner.
+function cardPreviewBack(plugin) {
+  const versionLabel = pluginVersionLabel(plugin);
+  const meta = [versionLabel ? versionLabel.replace(/^manifest\s+/, "") : "—", plugin.license || "Unknown", plugin.author]
+    .map((value) => escapeHtml(value))
+    .join(" · ");
+  return `<div class="plugin-preview-back" aria-hidden="true">
+        <p class="plugin-preview-back-description">${escapeHtml(plugin.description)}</p>
+        <p class="plugin-preview-back-meta">${meta}</p>
+      </div>`;
+}
+
+// Mouse hover over a preview turns it to its back; the rest of the card keeps its controls.
+function setupPreviewFlip(root) {
+  if (root.dataset.previewFlipReady === "true") return;
+  root.dataset.previewFlipReady = "true";
+  const sync = (event) => {
+    root.querySelectorAll(".plugin-preview-flip").forEach((flip) => {
+      const rect = flip.getBoundingClientRect();
+      const inside = event?.pointerType === "mouse"
+        && event.clientX >= rect.left && event.clientX <= rect.right
+        && event.clientY >= rect.top && event.clientY <= rect.bottom;
+      flip.classList.toggle("is-flipped", inside);
+    });
+  };
+  root.addEventListener("pointermove", sync);
+  root.addEventListener("pointerleave", () => sync());
+}
+
+function renderHiddenGems() {
+  const section = document.querySelector("#gems-section");
+  const grid = document.querySelector("#gems-grid");
+  if (!section || !grid) return;
+  const gems = state.engagementEnabled && state.engagementLoaded ? selectHiddenGems(state.plugins, state.engagement, { limit: 9 }) : [];
+  const median = gems.length ? medianInstallRate(state.plugins, state.engagement) : null;
+  section.hidden = gems.length === 0;
+  const rateOf = (plugin) => {
+    const stats = state.engagement[plugin.id] || {};
+    const views = Math.max(0, Math.trunc(Number(stats.views) || 0));
+    return views ? Math.min(views, Math.max(0, Math.trunc(Number(stats.copies) || 0))) / views : 0;
+  };
+  // The Wilson bound picks the gems; they are shown by the multiple on the card, so the visible numbers descend.
+  grid.innerHTML = gems.map((plugin) => ({ plugin, rate: rateOf(plugin) })).sort((a, b) => b.rate - a.rate).map(({ plugin, rate }) => {
+    // "Most plugins": at least half of all rated plugins have the median rate or less, so the multiple holds for them.
+    const times = median ? rate / median : 0;
+    return pluginCard(plugin, { previewBack: cardPreviewBack(plugin), gemTimes: times >= 1.1 ? times.toFixed(1) : "" });
+  }).join("");
+  bindCardActions(grid);
+  setupPreviewFlip(grid);
+  grid.scrollLeft = 0;
+  setupGemsCarousel(grid);
+}
+
+// One row of gems scrolled by page: the arrows move one visible width, and hide when every card already fits.
+function setupGemsCarousel(grid) {
+  const nav = document.querySelector(".gems-nav");
+  if (!nav) return;
+  const buttons = [...nav.querySelectorAll("[data-gems-step]")];
+  const update = () => {
+    const maxScroll = grid.scrollWidth - grid.clientWidth;
+    nav.hidden = maxScroll <= 1;
+    buttons.forEach((button) => {
+      button.disabled = Number(button.dataset.gemsStep) < 0 ? grid.scrollLeft <= 1 : grid.scrollLeft >= maxScroll - 1;
+    });
+  };
+  if (!grid.dataset.carousel) {
+    grid.dataset.carousel = "ready";
+    buttons.forEach((button) => button.addEventListener("click", () => {
+      const gap = Number.parseFloat(getComputedStyle(grid).columnGap) || 0;
+      grid.scrollBy({ left: Number(button.dataset.gemsStep) * (grid.clientWidth + gap), behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+    }));
+    grid.addEventListener("scroll", update, { passive: true });
+    addEventListener("resize", update);
+  }
+  update();
+}
+
+// Just landed: the last 24 hours as small cards drifting left to right in two rows (alternating newest first).
+// Each track holds its cards twice for a seamless loop; the copies are hidden from assistive technology and
+// focus. Hover, focus, and the Pause button stop the drift; reduced motion leaves scrollable static rows.
 function renderRecentlyAdded() {
   const section = document.querySelector("#recent-section");
-  const root = document.querySelector("#recent-grid");
-  if (!section || !root) return;
+  if (!section) return;
+  const summary = document.querySelector("#recent-summary");
+  const rows = document.querySelector("#recent-latest");
+  const toggle = document.querySelector("#recent-feed-toggle");
 
-  const recent = state.plugins
-    .filter((plugin) => (plugin.sourceType || "community") === "community" && isRecentlyAdded(plugin))
-    .sort((a, b) => listingTime(b) - listingTime(a) || a.name.localeCompare(b.name))
-    .slice(0, 3);
+  const now = Date.now();
+  const lastDay = recentListings(state.plugins, now, 24);
+  const lastWeek = recentListings(state.plugins, now, 7 * 24);
+  section.hidden = lastDay.length === 0;
+  if (summary) summary.innerHTML = `<b>${lastDay.length.toLocaleString("en-US")}</b> new in 24h · <b>${lastWeek.length.toLocaleString("en-US")}</b> in 7 days`;
+  if (!rows || !toggle) return;
 
-  section.hidden = recent.length === 0;
-  root.innerHTML = recent.map((plugin) => pluginCard(plugin, { showNew: true })).join("");
-  bindCardActions(root);
+  const items = lastDay.slice(0, 48);
+  const animated = items.length > 6 && !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  rows.hidden = items.length === 0;
+  rows.classList.toggle("is-animated", animated);
+  rows.querySelectorAll("[data-landed-row]").forEach((track, row) => {
+    const rowItems = items.filter((_, index) => index % 2 === row);
+    track.style.setProperty("--landed-duration", `${Math.max(30, rowItems.length * 5)}s`);
+    track.innerHTML = rowItems.map((plugin) => landedCard(plugin, now)).join("")
+      + (animated ? rowItems.map((plugin) => landedCard(plugin, now, true)).join("") : "");
+  });
+  toggle.hidden = !animated;
+  if (!toggle.dataset.ready) {
+    toggle.dataset.ready = "true";
+    toggle.addEventListener("click", () => {
+      const paused = rows.classList.toggle("is-paused");
+      toggle.textContent = paused ? "Play" : "Pause";
+      toggle.setAttribute("aria-label", `${paused ? "Play" : "Pause"} the Just landed feed`);
+    });
+  }
 }
 
 function renderPagination(totalItems, pageState) {
-  pagination.hidden = totalItems === 0 || pageState.totalPages <= 1;
+  const controls = catalogViewControls(totalItems, state.showAll, pluginsPerPage);
+  document.body.classList.toggle("catalog-show-all", controls.reserveDockSpace);
+  pagination.hidden = controls.paginationHidden || splitView();
+  splitPagePrevious.disabled = !pageState.hasPrevious;
+  splitPageNext.disabled = !pageState.hasNext;
+  splitPageInput.value = String(pageState.page);
+  splitPageInput.max = String(pageState.totalPages);
+  splitPageTotal.textContent = `of ${pageState.totalPages} · ${pageSize()} per page`;
+  viewToggle.hidden = controls.browseAllHidden || splitView();
+  viewDock.hidden = controls.dockHidden;
+  const sourceLabel = state.source === "builtin" ? "built-in" : "community";
+  viewLabel.textContent = `Browse all ${totalItems} ${sourceLabel} plugin${totalItems === 1 ? "" : "s"}`;
+  viewDockStatus.textContent = totalItems === 0
+    ? `No ${sourceLabel} plugins found`
+    : `Showing all ${totalItems} ${sourceLabel} plugin${totalItems === 1 ? "" : "s"}`;
+  viewButton.setAttribute("aria-expanded", "false");
   previousPage.disabled = !pageState.hasPrevious;
   nextPage.disabled = !pageState.hasNext;
   previousPageLabel.textContent = pageState.hasPrevious ? `Page ${pageState.page - 1}` : "First page";
@@ -576,30 +1123,346 @@ function renderPagination(totalItems, pageState) {
   nextPage.setAttribute("aria-label", pageState.hasNext
     ? `Go to plugin page ${pageState.page + 1}`
     : "No next plugin page");
-  pageAnnouncement.textContent = `Showing plugin page ${pageState.page} of ${pageState.totalPages}`;
 }
 
-function render({ historyMode = "replace" } = {}) {
+function splitTile(plugin, rank) {
+  const previewSource = plugin.previewThumbnail || plugin.previewImage;
+  const preview = previewSource
+    ? `<img class="split-tile-thumb" src="${escapeHtml(previewSource)}" alt="" loading="lazy" decoding="async">`
+    : `<span class="split-tile-thumb split-tile-mark" aria-hidden="true">${escapeHtml(plugin.initials)}</span>`;
+  const rankLabel = rank?.overall ? `#${rank.overall}` : "—";
+  const selected = plugin.id === state.selected;
+  return `
+    <a class="split-tile${selected ? " is-selected" : ""}" role="option" aria-selected="${selected}" data-split-plugin="${escapeHtml(plugin.id)}" href="plugin.html?id=${encodeURIComponent(plugin.id)}" target="_blank" rel="noopener" draggable="false" aria-label="${escapeHtml(plugin.name)}, rank ${escapeHtml(rankLabel)}. Control Enter opens the plugin page in a background tab">
+      ${preview}
+      <span class="split-tile-name">${escapeHtml(plugin.name)}</span>
+      <span class="split-tile-meta"><span>${escapeHtml(plugin.kind || plugin.category)}</span><b>${escapeHtml(rankLabel)}</b></span>
+    </a>`;
+}
+
+function splitStatRow(metric, label, icon, rank, value) {
+  const total = rank?.total || 0;
+  const position = rank?.[metric] || 0;
+  if (!position) {
+    return `
+    <div class="split-stat is-unranked" data-split-metric="${metric}">
+      <div class="split-stat-key"><span class="split-stat-icon">${icon}</span><b>${escapeHtml(formatEngagementCount(value))}</b><span class="sr-only">${label}</span></div>
+      <div class="split-stat-bar"></div>
+      <div class="split-stat-rank">Unranked<small>${total ? `of ${total}` : "no activity yet"}</small></div>
+    </div>`;
+  }
+  const percent = total > 1 ? Math.max(2, Math.round((1 - (position - 1) / (total - 1)) * 100)) : 100;
+  const top = Math.max(1, Math.round((position / total) * 100));
+  return `
+    <div class="split-stat" data-split-metric="${metric}">
+      <div class="split-stat-key"><span class="split-stat-icon">${icon}</span><b>${escapeHtml(formatEngagementCount(value))}</b><span class="sr-only">${label}</span></div>
+      <div class="split-stat-bar"><i style="width:${percent}%"></i><em style="left:${percent}%">top ${top}%</em></div>
+      <div class="split-stat-rank">#${position}<small>of ${total}</small></div>
+    </div>`;
+}
+
+function renderSplitView(pagePlugins) {
+  const ranks = catalogRanks();
+  if (!pagePlugins.some((plugin) => plugin.id === state.selected)) state.selected = pagePlugins[0]?.id || "";
+  splitGrid.innerHTML = pagePlugins.map((plugin) => splitTile(plugin, state.engagementLoaded ? ranks.get(plugin.id) : null)).join("");
+  splitGrid.classList.toggle("is-full", pagePlugins.length >= pageSize());
+  splitPanelCount.textContent = `${pagePlugins.length} of ${sourcePlugins().length}`;
+  splitTopRank.hidden = !state.engagementEnabled;
+  splitTopRank.setAttribute("aria-pressed", String(state.sort === "rank"));
+  const tiles = [...splitGrid.querySelectorAll("[data-split-plugin]")];
+  const selectTile = (tile, { focus = false, force = false } = {}) => {
+    tiles.forEach((other) => {
+      const active = other === tile;
+      other.classList.toggle("is-selected", active);
+      other.setAttribute("aria-selected", String(active));
+      other.tabIndex = active ? 0 : -1;
+    });
+    if (focus) tile.focus({ preventScroll: true });
+    if (!force && state.selected === tile.dataset.splitPlugin) return;
+    state.selected = tile.dataset.splitPlugin;
+    renderSplitSelection();
+  };
+  tiles.forEach((tile) => {
+    tile.tabIndex = tile.dataset.splitPlugin === state.selected ? 0 : -1;
+    tile.addEventListener("click", (event) => {
+      // Modifier clicks keep the browser's native background-tab behaviour; plain clicks only select.
+      if (event.ctrlKey || event.metaKey || event.shiftKey || event.button !== 0) {
+        selectTile(tile);
+        return;
+      }
+      event.preventDefault();
+      selectTile(tile, { focus: true });
+    });
+  });
+  splitGrid.onkeydown = (event) => {
+    let index = tiles.indexOf(document.activeElement);
+    if (index < 0) {
+      if (document.activeElement !== splitGrid) return;
+      index = Math.max(0, tiles.findIndex((tile) => tile.dataset.splitPlugin === state.selected));
+      if (!(event.key in { ArrowRight: 1, ArrowLeft: 1, ArrowDown: 1, ArrowUp: 1, Home: 1, End: 1, Enter: 1, " ": 1 })) return;
+      event.preventDefault();
+      selectTile(tiles[index], { focus: true });
+      return;
+    }
+    const columns = splitGridColumns();
+    const targets = {
+      ArrowRight: index + 1,
+      ArrowLeft: index - 1,
+      ArrowDown: index + columns,
+      ArrowUp: index - columns,
+      Home: 0,
+      End: tiles.length - 1,
+    };
+    if (event.key === "Enter") {
+      // Control or Command Enter lets the link open natively in a background tab; plain Enter only selects.
+      if (event.ctrlKey || event.metaKey || event.shiftKey) return;
+      event.preventDefault();
+      selectTile(tiles[index], { focus: true });
+      return;
+    }
+    if (event.key === " ") {
+      event.preventDefault();
+      selectTile(tiles[index], { focus: true });
+      return;
+    }
+    if (event.key === "PageDown" || event.key === "PageUp") {
+      const button = event.key === "PageDown" ? nextPage : previousPage;
+      if (button.disabled) return;
+      event.preventDefault();
+      splitFocusPending = true;
+      button.click();
+      return;
+    }
+    if (!(event.key in targets)) return;
+    event.preventDefault();
+    const target = targets[event.key];
+    if (target > tiles.length - 1 && !nextPage.disabled && event.key !== "End") {
+      splitFocusIndex = event.key === "ArrowDown" ? index % columns : 0;
+      nextPage.click();
+      return;
+    }
+    if (target < 0 && !previousPage.disabled && event.key !== "Home") {
+      splitFocusIndex = event.key === "ArrowUp" ? -columns + (index % columns) : -1;
+      previousPage.click();
+      return;
+    }
+    const next = tiles[Math.max(0, Math.min(tiles.length - 1, target))];
+    if (next) selectTile(next, { focus: true });
+  };
+  splitGrid.tabIndex = tiles.length ? -1 : 0;
+  if (splitFocusIndex !== null && tiles.length) {
+    const index = splitFocusIndex < 0 ? tiles.length + splitFocusIndex : splitFocusIndex;
+    splitFocusIndex = null;
+    selectTile(tiles[Math.max(0, Math.min(tiles.length - 1, index))], { focus: true, force: true });
+    return;
+  }
+  if (splitFocusPending) {
+    splitFocusPending = false;
+    tiles.find((tile) => tile.dataset.splitPlugin === state.selected)?.focus({ preventScroll: true });
+  }
+  renderSplitSelection();
+}
+
+let splitFocusPending = false;
+let splitFocusIndex = null;
+
+function splitGridColumns() {
+  const columns = getComputedStyle(splitGrid).gridTemplateColumns.split(" ").filter(Boolean).length;
+  return Math.max(1, columns);
+}
+
+function cardRankLabel(plugin) {
+  if (!state.engagementEnabled || !state.engagementLoaded) return "";
+  const rank = catalogRanks().get(plugin.id);
+  return rank?.overall ? `#${rank.overall}` : "";
+}
+
+function refreshCardRanks(root = document) {
+  root.querySelectorAll("[data-card-rank]").forEach((element) => {
+    const plugin = state.plugins.find((candidate) => candidate.id === element.dataset.cardRank);
+    const label = plugin ? cardRankLabel(plugin) : "";
+    element.textContent = label;
+    element.hidden = !label;
+  });
+}
+
+function refreshSplitRanks() {
+  const ranks = catalogRanks();
+  splitGrid.querySelectorAll("[data-split-plugin]").forEach((tile) => {
+    const rank = state.engagementLoaded ? ranks.get(tile.dataset.splitPlugin) : null;
+    const label = tile.querySelector(".split-tile-meta b");
+    if (label) label.textContent = rank?.overall ? `#${rank.overall}` : "—";
+  });
+  const plugin = sourcePlugins().find((candidate) => candidate.id === state.selected);
+  if (plugin) renderSplitStats(plugin);
+  refreshCardRanks();
+}
+
+function renderSplitSelection() {
+  const plugin = sourcePlugins().find((candidate) => candidate.id === state.selected);
+  if (!plugin) {
+    splitCard.innerHTML = "";
+    splitStatsBody.innerHTML = "";
+    return;
+  }
+  splitCard.innerHTML = pluginCard(plugin, { showNew: true });
+  bindCardActions(splitCard);
+  renderSplitStats(plugin);
+}
+
+function renderSplitStats(plugin) {
+  const stats = state.engagement[plugin.id] || { views: 0, copies: 0, hearts: 0 };
+  const rank = state.engagementLoaded ? catalogRanks().get(plugin.id) : null;
+  splitStatsTotal.textContent = `of ${rankedPlugins().length} community plugins`;
+  splitStatsBody.innerHTML = !state.engagementEnabled
+    ? '<p class="split-stats-empty">Engagement statistics are unavailable here.</p>'
+    : plugin.sourceType === "builtin"
+      ? '<p class="split-stats-empty">Built-in plugins are not ranked.</p>'
+    : !state.engagementLoaded
+      ? '<p class="split-stats-empty" aria-busy="true">Loading engagement statistics…</p>'
+      : [
+      ["hearts", "hearts", '<span class="social-glyph heart-glyph" aria-hidden="true">\uf004</span>'],
+      ["copies", "install copies", '<span class="copy-icon engagement-copy-icon" aria-hidden="true"></span>'],
+      ["views", "views", '<span class="engagement-glyph" aria-hidden="true">\uf441</span>'],
+      ["stars", "repository stars", '<svg class="social-glyph star-glyph" viewBox="0 0 14 14" aria-hidden="true"><path d="M7 .5 8.9 4.6l4.6.6-3.35 3.15L11 13 7 10.75 3 13l.85-4.65L.5 5.2l4.6-.6Z"/></svg>'],
+      ].map(([metric, label, icon]) => splitStatRow(metric, label, icon, rank, metric === "stars" ? plugin.stars || 0 : stats[metric])).join("");
+}
+
+function setCatalogView(view) {
+  state.view = view === "split" ? "split" : "cards";
+  storeCatalogView(state.view);
+  viewMode.querySelectorAll("[data-view]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.view === state.view));
+  });
+  document.body.classList.toggle("catalog-split-view", splitView());
+  if (splitView()) splitFilters.append(categoriesRoot);
+  else categoryBar.insertBefore(categoriesRoot, clearFilters);
+}
+
+function placeViewDock() {
+  if (!state.showAll) {
+    document.querySelector("#site-footer")?.before(viewDock);
+    return;
+  }
+  const cards = grid.querySelectorAll(".plugin-card");
+  if (cards.length > pluginsPerPage) grid.insertBefore(viewDock, cards[pluginsPerPage]);
+  else grid.after(viewDock);
+}
+
+function cancelViewScroll() {
+  if (!viewScrollFrame) return;
+  window.cancelAnimationFrame(viewScrollFrame);
+  viewScrollFrame = 0;
+}
+
+function restoreViewScroll(scrollTop) {
+  cancelViewScroll();
+  window.scrollTo({ top: scrollTop, behavior: "auto" });
+  viewScrollFrame = window.requestAnimationFrame(() => {
+    viewScrollFrame = window.requestAnimationFrame(() => {
+      viewScrollFrame = 0;
+      if (state.showAll) window.scrollTo({ top: scrollTop, behavior: "auto" });
+    });
+  });
+}
+
+function searchResultMessage(action) {
+  const totalItems = filteredPlugins().length;
+  return `${action}. ${totalItems} search result${totalItems === 1 ? "" : "s"}`;
+}
+
+function catalogResultMessage(totalItems, pageState) {
+  const sourceLabel = state.source === "builtin" ? "built-in" : "community";
+  if (totalItems === 0) return `No ${sourceLabel} plugins found`;
+  if (state.showAll) return `Showing all ${totalItems} ${sourceLabel} plugin${totalItems === 1 ? "" : "s"}`;
+  const shown = Math.min(pageSize(), totalItems - pageState.start);
+  return `Showing ${shown} of ${totalItems} ${sourceLabel} plugins, page ${pageState.page} of ${pageState.totalPages}`;
+}
+
+function focusCatalogResult() {
+  const resultLinks = grid.querySelectorAll(".plugin-card-link");
+  const target = state.showAll
+    ? resultLinks[pluginsPerPage] || resultLinks[0] || viewDockButton
+    : resultLinks[0] || document.querySelector("#empty-reset");
+  target?.focus({ preventScroll: true });
+}
+
+function catalogControlFocusToken(active) {
+  if (active === searchClear) return { type: "search-clear" };
+  const sourceButton = active?.closest?.("[data-source]");
+  if (sourceButton && sourcesRoot.contains(sourceButton)) return { type: "source" };
+  const categoryButton = active?.closest?.("[data-category]");
+  if (categoryButton && categoriesRoot.contains(categoryButton)) return { type: "category" };
+  const termButton = active?.closest?.("[data-search-term]");
+  if (!termButton || !searchTerms.contains(termButton)) return null;
+  return {
+    type: "term",
+    key: searchTermKey(state.terms[Number(termButton.dataset.searchTerm)]),
+  };
+}
+
+function restoreCatalogControlFocus(token) {
+  let target = null;
+  if (token?.type === "search-clear") {
+    target = searchClear.hidden ? search : searchClear;
+  } else if (token?.type === "source") {
+    target = [...sourcesRoot.querySelectorAll("[data-source]")]
+      .find((button) => button.dataset.source === state.source);
+  } else if (token?.type === "category") {
+    target = [...categoriesRoot.querySelectorAll("[data-category]")]
+      .find((button) => button.dataset.category === state.category);
+  } else if (token?.type === "term") {
+    target = [...searchTerms.querySelectorAll("[data-search-term]")]
+      .find((button) => searchTermKey(state.terms[Number(button.dataset.searchTerm)]) === token.key)
+      || search;
+  }
+  target?.focus({ preventScroll: true });
+  return Boolean(target);
+}
+
+function splitView() {
+  return state.view === "split";
+}
+
+function pageSize() {
+  return splitView() ? splitViewPageSize(splitGrid.clientWidth, { rows: splitViewRows }) : pluginsPerPage;
+}
+
+function render({ historyMode = "replace", announce = false } = {}) {
+  cancelViewScroll();
+  if (splitView()) state.showAll = false;
   const visible = filteredPlugins();
-  const pageState = paginationState(visible.length, state.page, pluginsPerPage);
-  state.page = pageState.page;
-  const pagePlugins = visible.slice(pageState.start, pageState.end);
-  const categoryPlugins = sourcePlugins().filter(
-    (plugin) => state.category === "all" || plugin.category === state.category,
-  );
+  const pageState = paginationState(visible.length, state.page, pageSize());
+  state.page = state.showAll ? 1 : pageState.page;
+  const pagePlugins = state.showAll
+    ? visible
+    : visible.slice(pageState.start, pageState.end);
+  const categoryPlugins = sourcePlugins().filter((plugin) => matchesCatalogFilter(plugin));
   const hasSearch = state.terms.length > 0 || Boolean(state.query.trim());
-  count.textContent = hasSearch
+  const hasResultFilter = hasSearch || verificationFilters.has(state.sort);
+  const authorTerm = state.terms.find((term) => term.type === "author");
+  catalogTitle.textContent = authorTerm ? `plugins by @${authorTerm.value}` : "browse all plugins";
+  count.textContent = hasResultFilter
     ? `${visible.length} of ${categoryPlugins.length}`
     : String(categoryPlugins.length);
   countLabel.textContent = state.category === "all"
     ? (state.source === "builtin" ? "built-in plugins" : "community plugins")
-    : `${state.source === "builtin" ? "built-in plugins" : "plugins"} in ${state.category}`;
-  grid.innerHTML = pagePlugins.map((plugin) => pluginCard(plugin, { showNew: true })).join("");
-  bindCardActions(grid);
-  grid.hidden = visible.length === 0;
+    : `${state.source === "builtin" ? "built-in plugins" : "plugins"} in ${catalogFilterLabel(state.category)}`;
+  if (splitView()) {
+    grid.innerHTML = "";
+    renderSplitView(pagePlugins);
+  } else {
+    grid.innerHTML = pagePlugins.map((plugin) => pluginCard(plugin, { showNew: true, previewBack: cardPreviewBack(plugin) })).join("");
+    bindCardActions(grid);
+    setupPreviewFlip(grid);
+  }
+  grid.hidden = visible.length === 0 || splitView();
+  splitRoot.hidden = visible.length === 0 || !splitView();
   empty.hidden = visible.length !== 0;
   renderPagination(visible.length, pageState);
+  placeViewDock();
   updateUrl(historyMode);
+  if (announce) catalogResultStatus.textContent = catalogResultMessage(visible.length, pageState);
 }
 
 function renderSourceFilters() {
@@ -640,37 +1503,57 @@ function renderSourceFilters() {
       renderSourceFilters();
       renderSortOptions();
       renderCategories();
-      render();
-      if (removedAuthorTerms.length || removedAuthorDraft) {
-        searchSuggestionStatus.textContent = "Author search terms are unavailable for built-in plugins";
+      const removedAuthorSearch = removedAuthorTerms.length || removedAuthorDraft;
+      render({ announce: !removedAuthorSearch });
+      if (removedAuthorSearch) {
+        searchSuggestionStatus.textContent = searchResultMessage(
+          "Removed author search terms because they are unavailable for built-in plugins",
+        );
       }
     });
   });
 }
 
 function renderSortOptions() {
-  sort.innerHTML = sortOptions[state.source]
+  const options = availableSortOptions();
+  sort.innerHTML = options
     .map(([value, label]) => `<option value="${value}">${label}</option>`)
     .join("");
-  if (!sortOptions[state.source].some(([value]) => value === state.sort)) {
-    state.sort = sourceDefaultSort();
-  }
+  if (!options.some(([value]) => value === state.sort)) state.sort = sourceDefaultSort();
   sort.value = state.sort;
 }
 
 function renderCategories() {
   const plugins = sourcePlugins();
-  const totals = new Map([["all", plugins.length]]);
-  plugins.forEach((plugin) => totals.set(plugin.category, (totals.get(plugin.category) || 0) + 1));
-  const sorted = [...totals.entries()].sort(([a], [b]) => {
-    if (a === "all") return -1;
-    if (b === "all") return 1;
-    return a.localeCompare(b);
-  });
+  const categoryTotals = catalogCategoryTotals(plugins);
+  const categoryFilters = [...categoryTotals.entries()]
+    .filter(([value]) => !taxonomyCatalogFilterNames.has(value))
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([value, total]) => ({ value, label: value, total }));
+  const tagFilters = taxonomyFilterTags
+    .map((tag) => ({
+      value: `tag:${tag}`,
+      label: displayTaxonomyTag(tag),
+      total: plugins.filter((plugin) => (plugin.tags || []).includes(tag)).length,
+    }))
+    .filter(({ total }) => total > 0);
+  const taxonomyFilters = taxonomyCatalogFilters
+    .map(([value, matches]) => ({
+      value,
+      label: value,
+      total: plugins.filter(matches).length,
+    }))
+    .filter(({ total }) => total > 0);
+  const filters = [
+    { value: "all", label: allCategoryLabel(), total: plugins.length },
+    ...categoryFilters,
+    ...tagFilters,
+    ...taxonomyFilters,
+  ];
 
-  categoriesRoot.innerHTML = sorted.map(([category, total]) => `
-    <button class="category-button${state.category === category ? " active" : ""}" type="button" data-category="${escapeHtml(category)}" aria-pressed="${state.category === category}">
-      <span>${escapeHtml(category === "all" ? allCategoryLabel() : category)}</span><span>${total}</span>
+  categoriesRoot.innerHTML = filters.map(({ value, label, total }) => `
+    <button class="category-button${state.category === value ? " active" : ""}" type="button" data-category="${escapeHtml(value)}" aria-pressed="${state.category === value}">
+      <span>${escapeHtml(label)}</span><span>${total}</span>
     </button>`).join("");
 
   categoriesRoot.querySelectorAll("[data-category]").forEach((button) => {
@@ -678,7 +1561,7 @@ function renderCategories() {
       state.category = button.dataset.category;
       state.page = 1;
       renderCategories();
-      render();
+      render({ announce: true });
     });
   });
 }
@@ -691,8 +1574,12 @@ function resetFilters() {
   search.value = "";
   closeSearchSuggestions();
   renderSearchTerms();
+  if (verificationFilters.has(state.sort)) {
+    state.sort = sourceDefaultSort();
+    renderSortOptions();
+  }
   renderCategories();
-  render();
+  render({ announce: true });
 }
 
 function updateUrl(historyMode = "replace") {
@@ -701,7 +1588,7 @@ function updateUrl(historyMode = "replace") {
   appendSearchState(params, { terms: state.terms, draft: state.query });
   if (state.category !== "all") params.set("category", state.category);
   if (state.sort !== sourceDefaultSort()) params.set("sort", state.sort);
-  if (state.page > 1) params.set("page", String(state.page));
+  appendCatalogViewState(params, { showAll: state.showAll, page: state.page });
   const next = `${location.pathname}${params.size ? `?${params}` : ""}${location.hash}`;
   if (historyMode === "none" || next === `${location.pathname}${location.search}${location.hash}`) return;
   history[historyMode === "push" ? "pushState" : "replaceState"](null, "", next);
@@ -719,11 +1606,13 @@ function restoreUrl() {
     : restoredSearch.draft;
   const requestedCategory = params.get("category") || "all";
   state.category = requestedCategory === "all" || sourcePlugins().some(
-    (plugin) => plugin.category === requestedCategory,
+    (plugin) => matchesCatalogFilter(plugin, requestedCategory),
   ) ? requestedCategory : "all";
-  state.page = Math.max(1, Number.parseInt(params.get("page") || "1", 10) || 1);
+  const viewState = readCatalogViewState(params);
+  state.showAll = viewState.showAll;
+  state.page = viewState.page;
   const requestedSort = params.get("sort") || sourceDefaultSort();
-  state.sort = sortOptions[state.source].some(([value]) => value === requestedSort)
+  state.sort = availableSortOptions().some(([value]) => value === requestedSort)
     ? requestedSort
     : sourceDefaultSort();
   search.value = state.query;
@@ -894,6 +1783,21 @@ async function init() {
   setupThemeToggle();
   setupCopyButtons();
   setupHeroRay();
+  document.addEventListener("click", () => closeVerificationTooltips());
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeVerificationTooltips();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (!splitView() || splitRoot.hidden || event.altKey || event.ctrlKey || event.metaKey) return;
+    if (!["ArrowRight", "ArrowLeft", "ArrowDown", "ArrowUp"].includes(event.key)) return;
+    const active = document.activeElement;
+    if (active && active !== document.body && !active.matches("main, section, [tabindex='-1']")) return;
+    const tile = splitGrid.querySelector(`[data-split-plugin="${CSS.escape(state.selected)}"]`) || splitGrid.querySelector("[data-split-plugin]");
+    if (!tile) return;
+    event.preventDefault();
+    tile.focus({ preventScroll: true });
+    tile.scrollIntoView({ block: "nearest" });
+  });
 
   try {
     const catalog = await loadCatalog();
@@ -901,13 +1805,117 @@ async function init() {
       throw new Error("Catalog response is invalid");
     }
     state.plugins = catalog.plugins;
+    state.engagementEnabled = Boolean(engagementApiBaseUrl());
     restoreUrl();
+    setCatalogView(readCatalogView());
+    viewMode.querySelectorAll("[data-view]").forEach((button) => {
+      button.addEventListener("click", () => {
+        if (button.dataset.view === state.view) return;
+        setCatalogView(button.dataset.view);
+        state.page = 1;
+        splitFocusPending = splitView();
+        render({ announce: true });
+      });
+    });
+    splitTopRank.addEventListener("click", () => {
+      state.sort = state.sort === "rank" ? sourceDefaultSort() : "rank";
+      state.page = 1;
+      renderSortOptions();
+      render({ announce: true });
+    });
+    const jumpToPage = () => {
+      const requested = Number.parseInt(splitPageInput.value, 10);
+      const totalPages = Number(splitPageInput.max) || 1;
+      const page = Number.isFinite(requested) ? Math.min(totalPages, Math.max(1, requested)) : state.page;
+      if (page === state.page) {
+        splitPageInput.value = String(state.page);
+        return;
+      }
+      state.page = page;
+      splitFocusPending = true;
+      render({ historyMode: "push", announce: true });
+    };
+    splitPageInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        jumpToPage();
+      } else if (event.key === "Escape") {
+        splitPageInput.value = String(state.page);
+        splitPageInput.blur();
+      }
+    });
+    splitPageInput.addEventListener("change", jumpToPage);
+    splitPagePrevious.addEventListener("click", () => previousPage.click());
+    splitPageNext.addEventListener("click", () => nextPage.click());
+    let splitResizeFrame = 0;
+    window.addEventListener("resize", () => {
+      if (!splitView() || splitResizeFrame) return;
+      splitResizeFrame = window.requestAnimationFrame(() => {
+        splitResizeFrame = 0;
+        render({ historyMode: "none" });
+      });
+    });
     renderSearchTerms();
     renderRecentlyAdded();
+    renderHiddenGems();
+    document.querySelector("#gems-sort-link")?.addEventListener("click", (event) => {
+      event.preventDefault();
+      state.sort = "installRate";
+      state.page = 1;
+      renderSortOptions();
+      render({ historyMode: "push", announce: true });
+      document.querySelector("#catalog").scrollIntoView({
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+        block: "start",
+      });
+    });
     renderSourceFilters();
     renderSortOptions();
     renderCategories();
     render();
+    if (state.engagementEnabled) {
+      loadEngagementStats().then((stats) => {
+        state.engagement = { ...stats, ...state.engagementAuthoritative };
+        state.engagementLoaded = true;
+        engagementVersion += 1;
+        renderHiddenGems();
+        document.querySelectorAll("[data-plugin-engagement]").forEach((summary) => {
+          const pluginId = summary.dataset.pluginEngagement;
+          const pluginStats = state.engagement[pluginId] || { views: 0, copies: 0, hearts: 0 };
+          updateEngagementSummary(document, pluginId, pluginStats);
+          updatePluginHeart(document, pluginId, pluginStats, {
+            hearted: hasPluginHeart(pluginId),
+          });
+        });
+        refreshCardRanks();
+        if (splitView() && !engagementSorts.has(state.sort)) render({ historyMode: "none" });
+        if (engagementSorts.has(state.sort)) {
+          const focusToken = pluginCardFocusToken();
+          render();
+          if (!restorePluginCardFocus(focusToken) && focusToken) focusCatalogResult();
+          const label = availableSortOptions().find(([value]) => value === state.sort)?.[1] || state.sort;
+          catalogResultStatus.textContent = `Engagement loaded. Sorted plugins by ${label.toLowerCase()}.`;
+        }
+      }).catch((reason) => {
+        console.warn("Engagement stats unavailable", reason);
+        const focusToken = pluginCardFocusToken();
+        state.engagementEnabled = false;
+        hidePendingEngagement(document);
+        if (splitView()) render({ historyMode: "none" });
+        const previousSort = state.sort;
+        const previousLabel = sortOptions[state.source]
+          .find(([value]) => value === previousSort)?.[1] || previousSort;
+        renderSortOptions();
+        if (state.sort !== previousSort) {
+          state.page = 1;
+          render();
+          if (!restorePluginCardFocus(focusToken) && focusToken) focusCatalogResult();
+          const fallbackLabel = availableSortOptions()
+            .find(([value]) => value === state.sort)?.[1] || state.sort;
+          catalogResultStatus.textContent = `${previousLabel} is unavailable because engagement stats could not be loaded. Showing ${fallbackLabel.toLowerCase()}.`;
+        }
+      });
+    }
   } catch (error) {
     console.error(error);
     grid.hidden = true;
@@ -920,12 +1928,13 @@ async function init() {
     state.query = search.value;
     state.page = 1;
     updateSearchAffordances();
-    updateSearchSuggestions();
     render();
+    scheduleSearchSuggestions();
   });
 
   search.addEventListener("keydown", (event) => {
     if (event.isComposing) return;
+    if (["Enter", "ArrowDown", "ArrowUp", "ArrowRight", "Tab", "Escape"].includes(event.key)) flushSearchSuggestions();
     if (handleSearchEscape(event, {
       hasSuggestions: !searchSuggestions.hidden,
       closeSuggestions: closeSearchSuggestions,
@@ -934,7 +1943,7 @@ async function init() {
         state.query = "";
         state.page = 1;
         updateSearchAffordances();
-        render();
+        render({ announce: true });
         search.blur();
       },
     })) return;
@@ -1004,12 +2013,12 @@ async function init() {
   sort.addEventListener("change", () => {
     state.sort = sort.value;
     state.page = 1;
-    render();
+    render({ announce: true });
   });
 
   const changePage = (offset) => {
     state.page += offset;
-    render({ historyMode: "push" });
+    render({ historyMode: "push", announce: true });
     const firstResult = grid.querySelector(".plugin-card-link");
     firstResult?.focus({ preventScroll: true });
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -1021,14 +2030,40 @@ async function init() {
   nextPage.addEventListener("click", () => {
     if (!nextPage.disabled) changePage(1);
   });
+  viewButton.addEventListener("click", () => {
+    const previousScrollTop = window.scrollY;
+    state.showAll = true;
+    state.page = 1;
+    render({ historyMode: "push", announce: true });
+    const resultLinks = grid.querySelectorAll(".plugin-card-link");
+    resultLinks[pluginsPerPage]?.focus({ preventScroll: true });
+    restoreViewScroll(previousScrollTop);
+  });
+  viewDockButton.addEventListener("click", () => {
+    state.showAll = false;
+    state.page = 1;
+    render({ historyMode: "push", announce: true });
+    focusCatalogResult();
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    grid.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "start" });
+  });
   window.addEventListener("popstate", () => {
+    const active = document.activeElement;
+    const controlFocus = catalogControlFocusToken(active);
+    const catalogHadFocus = Boolean(controlFocus)
+      || grid.contains(active)
+      || empty.contains(active)
+      || pagination.contains(active)
+      || viewToggle.contains(active)
+      || viewDock.contains(active);
     closeSearchSuggestions();
     restoreUrl();
     renderSearchTerms();
     renderSourceFilters();
     renderSortOptions();
     renderCategories();
-    render({ historyMode: "none" });
+    render({ historyMode: "replace", announce: true });
+    if (!restoreCatalogControlFocus(controlFocus) && catalogHadFocus) focusCatalogResult();
   });
 
   document.querySelector("#clear-filters").addEventListener("click", resetFilters);

@@ -27,6 +27,7 @@ Choose one category:
 - `Desktop`
 - `Developer Tools`
 - `Hardware`
+- `Kids`
 - `Productivity`
 - `System`
 - `Widgets`
@@ -36,13 +37,17 @@ Choose one to three tags:
 
 - `ai`
 - `bar`
+- `education`
+- `games`
 - `hyprland`
+- `kids`
 - `launcher`
 - `media`
 - `power-management`
 - `quickshell`
 - `security`
 - `system`
+- `vpn`
 - `workspaces`
 
 Copy category and tag values without the bullet marker or backticks. Categories are case-sensitive and must match the spelling above exactly. Tags may be comma-separated or entered one per line.
@@ -102,7 +107,7 @@ Create the issue with an authenticated [GitHub CLI](https://cli.github.com/):
 ${EDITOR:-vi} /tmp/omarchy-plugin-submission.md
 
 gh issue create \
-  --repo HANCORE-linux/omarchy-plugin-marketplace \
+  --repo omacom/omarchy-plugin-marketplace \
   --title "[Plugin]: plugin_name" \
   --body-file /tmp/omarchy-plugin-submission.md
 ```
@@ -120,12 +125,26 @@ When preparing a submission for someone:
 5. Show the completed title and body to the owner before creating the issue.
 6. Create the GitHub issue only after the owner explicitly approves the submission.
 
-After a correctly formatted issue opens, automated validation posts its result on the issue. A maintainer must still review and approve the plugin before it appears in the marketplace.
+After a correctly formatted issue opens, automated validation and the **Automated Security Baseline** post their results on the issue. The baseline statically checks the exact validated commit without executing plugin code and reports `passed`, `review-required`, or `needs-fixes`. A new listing can be published only through `approved-and-verified`. A current `passed` result becomes automatically `Verified`; under selective policy, a `review-required` disposition requires an authorized maintainer to accept the exact reported capabilities and non-selectively-blocking findings. Selectively blocking findings must be fixed in a new validated commit before initial publication, and scan failures remain fail closed because no complete result exists.
+
+The baseline intentionally detects a small set of deterministic patterns, such as direct download-to-shell execution, unpinned external Git source execution, dangerous passwordless sudoers policies, and privileged process control sourced from predictable shared temporary state. It does not perform general data-flow analysis or attempt to detect every unsafe behavior. A maintainer must still review the exact checked commit and apply `approved-and-verified` before it appears in the marketplace. For a selective review result, that action records the accepted finding and capability sets in a commit-bound maintainer attestation after a fresh matching scan. Read the [security policy and baseline](SECURITY.md#automated-security-baseline) for the complete contributor policy, documented patterns, limits, and remediation requirements.
+
+**This is not a security audit, certification, warranty, or endorsement.**
 
 ## Respond to validation and publication feedback
 
-The marketplace bot keeps one validation status comment on the issue and updates it after each retry. A failed status includes a concise reason and the next action. Correct the existing repository or issue instead of opening a duplicate submission, then edit the issue to run validation again.
+The marketplace bot keeps one validation comment and one automated-security-baseline comment on the issue and updates them after each retry. A failed status includes a concise reason and the next action. Correct the existing repository or issue instead of opening a duplicate submission, then edit the issue to run validation again.
 
-Approval and publication failures use a separate status comment with the failed phase, a safe error summary, the required action, and a workflow link. When approval fails, the `approved-for-listing` label is removed automatically. Fix the reported problem and ask a maintainer to reapply the label after validation passes; rerunning the old failed workflow does not restore the label. If registration succeeded but deployment or issue finalization failed, do not resubmit the plugin or reapply the approval label—a maintainer must retry or complete the reported publication phase.
+Approval and publication failures append a historical, run-scoped status comment with the failed phase, a safe error summary, the required action, and a workflow link. An older run never overwrites a newer run's report or removes its approval label. Approval is bound to the exact validated commit and a bot-authored report that predates the `approved-and-verified` event. The workflow performs a fresh exact-commit scan. A matching `passed` result stores current automated facts; a matching selective `review-required` disposition also stores an exact-evidence maintainer attestation with accepted findings, capabilities, reviewer, label-event, report, rescan, and review times. Neither path creates an editable verification flag. Later scheduled catalog refreshes continue to inspect the repository's branch head for compatibility and do not rerun the snapshot security baseline. If a different upstream commit is observed, the marketplace shows `Update unverified`; the stored evidence continues to describe only the exact approved snapshot. When approval or publication fails before registration, the failure handler leaves `approved-and-verified` unchanged. A label left in place does not mean publication succeeded. Fix the reported problem and ask a maintainer to review the current report, finalize all setup labels (including `manual-setup`), then remove any remaining approval label and set `approved-and-verified` last. Do not restore a withdrawn approval while blockers remain. Rerunning the old failed workflow does not create a new request. If registration succeeded but deployment or issue finalization failed, do not resubmit the plugin or reapply the approval label: a maintainer must retry or complete the reported publication phase.
 
-If no automated validation comment appears, edit the existing issue and verify that its title starts with `[Plugin]:`, all six headings remain in their original order, the category matches exactly, and all five checklist items are checked. Editing the issue runs submission detection again.
+If no automated validation comment appears, edit the existing issue and verify that its title starts with `[Plugin]:`, all six headings remain in their original order, the category matches exactly, and all five checklist items are checked. Editing the issue runs submission detection again. `approved-for-listing` remains only on historical issues as a legacy audit label and no longer publishes new submissions.
+
+## Update an existing listing
+
+Use the single [**Plugin verification** issue form](https://github.com/omacom/omarchy-plugin-marketplace/issues/new?template=verify-plugin.yml), select **Verify and publish a newer upstream commit**, and enter the exact existing plugin ID, repository root URL, and full 40-character SHA of current repository HEAD. The update must preserve the configured plugin ID set; multi-plugin sources are promoted source-wide.
+
+Compatibility validation and the Automated Security Baseline run against that exact commit without executing community code. The existing snapshot remains unchanged while the update is pending. A write-authorized maintainer applies `approved-and-verified` only after reviewing the current bot reports. Publication rescans the same commit and requires exact repository, plugin-set, policy, outcome, finding, capability, report, event, and reviewer binding. Selectively blocking findings and scan failures block promotion; non-selectively-blocking findings require exact maintainer attestation. A successful update atomically replaces the current marketplace snapshot and canonical evidence while retaining the superseded evidence in registry history.
+
+## Verify an existing snapshot
+
+Use the same [**Plugin verification** issue form](https://github.com/omacom/omarchy-plugin-marketplace/issues/new?template=verify-plugin.yml) and select **Verify the currently listed snapshot** for the commit already recorded by the listing. The request must identify the existing plugin ID, repository, and full `listingValidatedCommit` exactly. This path reruns the static baseline only for that recorded commit. A complete `passed` result with no findings or review capabilities publishes snapshot verification automatically. A write-authorized maintainer may also apply `maintainer-verified` after reviewing a bot-authored `review-required` report; publication then requires an exact match between that report and a fresh scan. For a different current HEAD commit, select the newer-upstream action in the same form. Findings, scan failures, stale evidence, and mismatches remain `Unverified`; this is not a claim that the plugin is malicious. Read [Plugin Verification](VERIFICATION.md) for the complete status definition, process, display states, and installation boundary.

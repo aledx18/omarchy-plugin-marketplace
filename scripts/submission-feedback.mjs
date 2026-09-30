@@ -78,31 +78,83 @@ const feedback = Object.freeze({
   },
   "approval-body-changed": {
     reason: "The submission changed after the approval label was applied.",
-    action: "Review the updated issue and reapply `approved-for-listing` after validation passes.",
+    action: "Review the updated issue and reapply `approved-and-verified` after validation passes.",
   },
   "approval-permission-denied": {
     reason: "The account applying the approval label does not have write permission.",
     action: "A marketplace maintainer must review and approve the submission.",
   },
+  "approval-event-invalid": {
+    reason: "The approved-and-verified trigger is missing, ambiguous, or superseded by another label event.",
+    action: "Review the current report, then remove and reapply `approved-and-verified`.",
+  },
   "approval-issue-closed": {
     reason: "Approval requires an open submission issue.",
-    action: "Reopen and review the issue before reapplying `approved-for-listing`.",
+    action: "Reopen and review the issue before reapplying `approved-and-verified`.",
   },
   "approval-label-missing": {
     reason: "A required submission or approval label is missing.",
-    action: "Restore the required labels after review instead of rerunning the failed workflow.",
+    action: "Check whether approval was withdrawn. Do not restore it while blockers remain. A new approval requires review of the current evidence; do not rerun this workflow.",
+  },
+  "approval-label-changed": {
+    reason: "The manual-setup label differs from the state captured when approval was requested.",
+    action: "Review and finalize setup labels first. Then remove any remaining `approved-and-verified` label and set it last to request approval again.",
   },
   "approval-source-changed": {
     reason: "The repository is already registered with a different plugin set.",
-    action: "Review the existing listing and current manifests before reapplying `approved-for-listing`.",
+    action: "Review the existing listing and current manifests before reapplying `approved-and-verified`.",
   },
   "approval-metadata-changed": {
     reason: "The repository is already registered with different listing metadata.",
-    action: "Review the existing listing and approval labels before reapplying `approved-for-listing`.",
+    action: "Review the existing listing and approval labels before reapplying `approved-and-verified`.",
+  },
+  "approval-blocking-label": {
+    reason: "The submission still has an unresolved blocking label.",
+    action: "Resolve the reported issue and remove its blocking label before reapplying `approved-and-verified`.",
+  },
+  "approval-security-baseline-missing": {
+    reason: "The submission has no automated security baseline result.",
+    action: "Edit the submission issue to run validation, then reapply `approved-and-verified` after the baseline completes.",
+  },
+  "approval-security-baseline-invalid": {
+    reason: "The automated security baseline metadata is invalid or belongs to another repository.",
+    action: "Edit the submission issue to generate a new baseline before reapplying `approved-and-verified`.",
+  },
+  "approval-security-baseline-changed": {
+    reason: "The fresh exact-commit scan does not match the bot report approved by the maintainer.",
+    action: "Edit the submission issue to publish a current report, review it, then reapply `approved-and-verified`.",
+  },
+  "approval-security-needs-fixes": {
+    reason: "The automated security baseline has selectively blocking findings that prevent a verified initial listing.",
+    action: "Fix every selectively blocking finding and edit the submission issue to validate a new commit before reapplying `approved-and-verified`.",
+  },
+  "approval-upstream-changed": {
+    reason: "The upstream repository changed after the automated security baseline was recorded.",
+    action: "Edit the submission issue to validate the new commit before reapplying `approved-and-verified`.",
+  },
+  "approval-verification-invalid": {
+    reason: "The approved exact-commit evidence did not produce a valid Verified listing.",
+    action: "A maintainer must review the workflow and evidence before retrying approval.",
+  },
+  "verification-review-expectation-mismatch": {
+    reason: "The fresh baseline evidence does not match the report approved by the maintainer.",
+    action: "Edit the submission issue to publish a current report, review it, then reapply `approved-and-verified`.",
+  },
+  "verification-review-invalid": {
+    reason: "The maintainer-review evidence is invalid or no longer eligible.",
+    action: "Edit the submission issue to publish a current report before retrying approval.",
+  },
+  "security-baseline-unavailable": {
+    reason: "The exact submitted commit could not be scanned completely during approval.",
+    action: "Retry validation after GitHub access recovers, then review the new report before approval.",
+  },
+  "security-baseline-scan-limit": {
+    reason: "The exact submitted commit exceeds a deterministic security scan limit.",
+    action: "Reduce the relevant source scope and edit the submission issue to validate a new commit.",
   },
   "approval-service-error": {
     reason: "The approval service could not complete the submission checks.",
-    action: "A maintainer must review the workflow before reapplying `approved-for-listing`.",
+    action: "A maintainer must review the workflow before reapplying `approved-and-verified`.",
   },
   "validation-internal-error": {
     reason: "Marketplace validation could not complete safely.",
@@ -176,7 +228,7 @@ export function publicSubmissionFailure(error, { phase = "validation" } = {}) {
       .replace(/[,;]?\s+(?:(?:and|then)\s+)?edit the issue to (?:run validation again|retry)\.?$/i, "")
       .replace(/[.!?]+$/, "")
       .trim();
-    action = `${prerequisite}. Then reapply \`approved-for-listing\` after validation passes.`;
+    action = `${prerequisite}. Then reapply \`approved-and-verified\` after validation passes.`;
   } else if (phase === "approval" && known && [
     "repository-unreachable",
     "manifest-invalid",
@@ -193,7 +245,7 @@ export function publicSubmissionFailure(error, { phase = "validation" } = {}) {
       .replace(/[,;]?\s+(?:(?:and|then)\s+)?edit the issue to (?:run validation again|retry)\.?$/i, "")
       .replace(/[.!?]+$/, "")
       .trim();
-    action = `${prerequisite}. Then reapply \`approved-for-listing\` after validation passes.`;
+    action = `${prerequisite}. Then reapply \`approved-and-verified\` after validation passes.`;
   }
   return {
     code: known ? error.code : fallbackCode,

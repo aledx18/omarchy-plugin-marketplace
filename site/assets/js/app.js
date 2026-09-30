@@ -37,14 +37,14 @@ import {
   storeCatalogView,
   updateEngagementSummary,
   updatePluginHeart
-} from "./shared.js?v=20260923-01";
+} from "./shared.js?v=20260930-01";
 import {
   engagementApiBaseUrl,
   hasPluginHeart,
   loadEngagementStats,
   recordPluginCopy,
   recordPluginHeart,
-} from "./engagement.js?v=20260923-01";
+} from "./engagement.js?v=20260930-01";
 import {
   appendSearchState,
   committedTermsFromDraft,
@@ -72,13 +72,13 @@ import {
   searchTermInputValue,
   searchTermKey,
   selectSearchCompletions,
-} from "./search.js?v=20260923-01";
+} from "./search.js?v=20260930-01";
 import {
   catalogCategoryTotals,
   matchesBarTaxonomy,
   matchesKidsTaxonomy,
   matchesVpnTaxonomy,
-} from "./taxonomy.js?v=20260923-01";
+} from "./taxonomy.js?v=20260930-01";
 
 const pluginsPerPage = 9;
 const splitViewRows = 3;
@@ -179,6 +179,7 @@ const state = {
 };
 
 const grid = document.querySelector("#plugin-grid");
+const catalogTitle = document.querySelector("#catalog-title");
 const count = document.querySelector("#plugin-count");
 const countLabel = document.querySelector("#plugin-count-label");
 const empty = document.querySelector("#empty-state");
@@ -1439,6 +1440,8 @@ function render({ historyMode = "replace", announce = false } = {}) {
   const categoryPlugins = sourcePlugins().filter((plugin) => matchesCatalogFilter(plugin));
   const hasSearch = state.terms.length > 0 || Boolean(state.query.trim());
   const hasResultFilter = hasSearch || verificationFilters.has(state.sort);
+  const authorTerm = state.terms.find((term) => term.type === "author");
+  catalogTitle.textContent = authorTerm ? `plugins by @${authorTerm.value}` : "browse all plugins";
   count.textContent = hasResultFilter
     ? `${visible.length} of ${categoryPlugins.length}`
     : String(categoryPlugins.length);
